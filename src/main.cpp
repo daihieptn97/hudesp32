@@ -1,680 +1,514 @@
-// PlatformIO required include
-#include <Arduino.h>
-
-#include <TFT_eSPI.h>
-#include <NTPClient.h>
-#include <WiFi.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
 #include <BLE2902.h>
+#include <Button2.h>
+#include <TFT_eSPI.h>
+#include "DataConstants.h"
+#include "ImagesOther.h"
+#include "ImagesDirections.h"
+#include "ImagesLanes.h"
+#include "VoltageMeasurement.h"
 
-// Prepare WiFi
-const char *ssid = "RD_Hunonic_Mesh"; // Replace with your
-const char *password = "66668888";    // WiFi credentials
+// ---- Config ----
+#define SERVICE_UUID "DD3F0AD1-6239-4E1F-81F1-91F6C9F01D86"
+#define CHAR_INDICATE_UUID "DD3F0AD2-6239-4E1F-81F1-91F6C9F01D86"
+#define CHAR_WRITE_UUID "DD3F0AD3-6239-4E1F-81F1-91F6C9F01D86"
 
-// BLE UUIDs - giống với BLEHUDNaviESP32
-#define SERVICE_UUID        "DD3F0AD1-6239-4E1F-81F1-91F6C9F01D86"
-#define CHAR_INDICATE_UUID  "DD3F0AD2-6239-4E1F-81F1-91F6C9F01D86"
-#define CHAR_WRITE_UUID     "DD3F0AD3-6239-4E1F-81F1-91F6C9F01D86"
+#define COLOR_BLACK TFT_BLACK
+#define COLOR_WHITE TFT_WHITE
+#define COLOR_RED TFT_RED
+#define COLOR_MAGENTA 0xF81F
+#define COLOR_BLUE TFT_BLUE
 
-// BLE definitions
-#define SERVICE_UUID        "DD3F0AD1-6239-4E1F-81F1-91F6C9F01D86"
-#define CHAR_INDICATE_UUID  "DD3F0AD2-6239-4E1F-81F1-91F6C9F01D86"
-#define CHAR_WRITE_UUID     "DD3F0AD3-6239-4E1F-81F1-91F6C9F01D86"
+#define ENABLE_VOLTAGE_MEASUREMENT false
+// Định nghĩa lại nút bấm cho LilyGO T-Display-S3
+#define TTGO_LEFT_BUTTON 0   // Giữ nguyên nút trái
+#define TTGO_RIGHT_BUTTON 14 // Cập nhật nút phải phù hợp với T-Display-S3
 
-// Search your next airport here and get the ICAO code
-// https://en.wikipedia.org/wiki/ICAO_airport_code
-const char *metar = "https://aviationweather.gov/api/data/metar?ids=KDEN&format=json"; // KDEN = Denver
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP);
-int wifiTimeOutCounter = 0;
-#define TIMEOFFSET -3600 * 5 // no daylight saving time
-
-// Init parameter for universe simulation - giảm độ phức tạp để tăng hiệu suất
-int const n = 3, m = 100; // Giảm số lượng điểm để tránh làm chậm và che mất văn bản
-float const r = 0.1;
-float x = 0, v = 0, t = 0; // v is used in the loop animation
-
-// Definition for the screen
-#define MAX_Y 170
-#define MAX_X 320
+// ---- Globals ----
 TFT_eSPI tft = TFT_eSPI();
-TFT_eSprite spr = TFT_eSprite(&tft); // Declare Sprite object "spr" with pointer to "tft" object
-
-// Màu sắc - giống với BLEHUDNaviESP32
-#define COLOR_BLACK    0x0000
-#define COLOR_WHITE    0xFFFF
-#define COLOR_MAGENTA  0xF81F
-#define COLOR_RED      TFT_RED
-#define COLOR_GREEN    TFT_GREEN
-#define COLOR_BLUE     TFT_BLUE
-#define COLOR_YELLOW   TFT_YELLOW
-
-// Biến canvas - tương tự với g_canvas trong BLEHUDNaviESP32
-uint16_t* canvas = NULL;
-const int CANVAS_SIZE_BYTES = MAX_X * MAX_Y * sizeof(uint16_t);
-
-// Set global variables for the weather information
-int temperature = 0; // °C
-int dew_point = 0;   // °C
-int wind_speed_knots = 0;
-int pressure = 0;          // hPa
-int relative_humidity = 0; // %
-int wind_speed_kmh = 0;
-int data_age_min = 0;
-unsigned long epochTime = 0;
-unsigned long obsTime = 0;
-
-// Biến lưu thông tin về ESP32 và màn hình
-String chipModel;
-int chipRevision;
-int chipCores;
-uint32_t chipId;
-String macAddress;
-uint64_t uid;
-String ipAddress;
-String displayInfo = "ST7789 TFT Display";
-String displayDriver = "Bodmer TFT_eSPI";
-String mcuType = "LilyGO T-Display-S3"; // Tên board dựa trên info.md
-
-// BLE variables - tương tự với BLEHUDNaviESP32
-BLEServer* g_pServer = NULL;
-BLECharacteristic* g_pCharIndicate = NULL;
+BLEServer *g_pServer = nullptr;
+BLECharacteristic *g_pCharIndicate = nullptr;
 bool g_deviceConnected = false;
 uint32_t g_lastActivityTime = 0;
 bool g_isNaviDataUpdated = false;
 std::string g_naviData;
 
-// Button definitions - tương tự với BLEHUDNaviESP32
-#define TTGO_LEFT_BUTTON 0
-#define GPIO_NUM_TTGO_LEFT_BUTTON GPIO_NUM_0
-#define TTGO_RIGHT_BUTTON 35
-#define BUTTON_DEEP_SLEEP TTGO_LEFT_BUTTON
-#define GPIO_NUM_WAKEUP GPIO_NUM_TTGO_LEFT_BUTTON
+Button2 btnDeepSleep(TTGO_LEFT_BUTTON);
+Button2 btnVol(TTGO_RIGHT_BUTTON);
 bool g_sleepRequested = false;
+// Cập nhật các chân đo điện áp phù hợp với T-Display-S3
+static VoltageMeasurement g_voltage(4, 8);
+bool g_showVoltage = false;
 
-// Biến hiển thị voltage nếu cần
-static bool g_showVoltage = false;
-
-// Update parameter for the weather data
-unsigned long previousMillis = 0;
-#define INTERVAL 60000 * 5 // 5 min
-
-// Bluetooth event callbacks - giống với BLEHUDNaviESP32
-class MyServerCallbacks: public BLEServerCallbacks
+// ---- NUOVA GESTIONE STATI ----
+enum DisplayState
 {
-    void onConnect(BLEServer* pServer) override
+    STATE_STARTING,
+    STATE_DISCONNECTED,
+    STATE_NO_ROUTE,
+    STATE_NAVIGATING,
+    STATE_RECALCULATING
+};
+DisplayState g_currentState = STATE_STARTING;
+DisplayState g_lastState = STATE_STARTING;
+DisplayState g_previousState = STATE_STARTING;
+
+// Variabili per delta-update
+uint8_t lastSpeed = 0;
+uint8_t lastDir = DirectionNone;
+
+// ---- NUOVE FUNZIONI GRAFICHE ----
+
+void playStartupAnimation()
+{
+    tft.fillScreen(COLOR_BLACK);
+    tft.setTextColor(COLOR_WHITE, COLOR_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("Navigatore BLE", tft.width() / 2, tft.height() / 2 - 40);
+    tft.drawString("Inizializzazione...", tft.width() / 2, tft.height() / 2 - 20);
+
+    int barWidth = 150;
+    int barHeight = 10;
+    int barX = (tft.width() - barWidth) / 2;
+    int barY = tft.height() / 2 + 20;
+
+    tft.drawRect(barX, barY, barWidth, barHeight, COLOR_WHITE);
+
+    for (int i = 0; i < barWidth - 4; i++)
+    {
+        tft.fillRect(barX + 2, barY + 2, i, barHeight - 4, COLOR_BLUE);
+        delay(15);
+    }
+    delay(500);
+    tft.setTextDatum(TL_DATUM);
+}
+
+void showDisconnectedScreen()
+{
+    tft.fillScreen(COLOR_BLACK);
+    tft.setTextColor(COLOR_RED, COLOR_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(2);
+    tft.drawString("Disconnesso", tft.width() / 2, tft.height() / 2 - 15);
+    tft.setTextColor(COLOR_WHITE, COLOR_BLACK);
+    tft.setTextSize(1);
+    tft.drawString("In attesa di connessione...", tft.width() / 2, tft.height() / 2 + 15);
+    tft.setTextDatum(TL_DATUM);
+}
+
+void showNoRouteScreen()
+{
+    tft.fillScreen(COLOR_BLACK);
+    tft.setTextColor(COLOR_WHITE, COLOR_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(2);
+    tft.drawString("Connesso", tft.width() / 2, tft.height() / 2 - 15);
+    tft.setTextSize(1);
+    tft.drawString("In attesa di un percorso...", tft.width() / 2, tft.height() / 2 + 15);
+    tft.setTextDatum(TL_DATUM);
+}
+
+void showRecalculatingScreen()
+{
+    tft.fillScreen(COLOR_BLACK);
+    tft.setTextColor(COLOR_MAGENTA, COLOR_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(2);
+    tft.drawString("Ricalcolo...", tft.width() / 2, tft.height() / 2);
+}
+
+// ---- Helpers ----
+uint16_t Color4To16bit(uint8_t c4)
+{
+    uint16_t r = (c4 & 0x0F) * 0x1F / 0x0F;
+    uint16_t g = (c4 & 0x0F) * 0x3F / 0x0F;
+    uint16_t b = (c4 & 0x0F) * 0x1F / 0x0F;
+    return (r << 11) | (g << 5) | b;
+}
+
+void Draw4bitImageProgmem(int x, int y, int w, int h, const uint8_t *img)
+{
+    int pixels = w * h;
+    for (int i = 0; i < pixels; i += 2)
+    {
+        uint8_t data = pgm_read_byte(img++);
+        uint8_t p1 = data & 0x0F, p2 = data >> 4;
+        int x1 = x + (i % w), y1 = y + (i / w);
+        int x2 = x1 + 1;
+        tft.drawPixel(x1, y1, Color4To16bit(p1));
+        if ((i + 1) < pixels)
+            tft.drawPixel(x2, y1, Color4To16bit(p2));
+    }
+}
+
+void Draw4bitImageProgmemScaled(int x, int y, int w, int h, const uint8_t *img, int scale)
+{
+    int pixels = w * h;
+    for (int i = 0; i < pixels; i += 2)
+    {
+        uint8_t data = pgm_read_byte(img++);
+        uint8_t p1 = data & 0x0F, p2 = data >> 4;
+        int origX = i % w;
+        int origY = i / w;
+        tft.fillRect(x + origX * scale, y + origY * scale, scale, scale, Color4To16bit(p1));
+        if (i + 1 < pixels)
+        {
+            origX = (i + 1) % w;
+            origY = (i + 1) / w;
+            tft.fillRect(x + origX * scale, y + origY * scale, scale, scale, Color4To16bit(p2));
+        }
+    }
+}
+
+const uint8_t *ImageFromDirection(uint8_t direction)
+{
+    switch (direction)
+    {
+    case DirectionNone:
+        return nullptr;
+    case DirectionStart:
+    case DirectionEnd:
+    case DirectionVia:
+        return IMG_directionWaypoint;
+    case DirectionEasyLeft:
+        return IMG_directionEasyLeft;
+    case DirectionEasyRight:
+        return IMG_directionEasyRight;
+    case DirectionKeepLeft:
+        return IMG_directionKeepLeft;
+    case DirectionKeepRight:
+        return IMG_directionKeepRight;
+    case DirectionLeft:
+        return IMG_directionLeft;
+    case DirectionOutOfRoute:
+        return IMG_directionOutOfRoute;
+    case DirectionRight:
+        return IMG_directionRight;
+    case DirectionSharpLeft:
+        return IMG_directionSharpLeft;
+    case DirectionSharpRight:
+        return IMG_directionSharpRight;
+    case DirectionStraight:
+        return IMG_directionStraight;
+    case DirectionUTurnLeft:
+        return IMG_directionUTurnLeft;
+    case DirectionUTurnRight:
+        return IMG_directionUTurnRight;
+    case DirectionFerry:
+        return IMG_directionFerry;
+    case DirectionStateBoundary:
+        return IMG_directionStateBoundary;
+    case DirectionFollow:
+        return IMG_directionFollow;
+    case DirectionMotorway:
+        return IMG_directionMotorway;
+    case DirectionTunnel:
+        return IMG_directionTunnel;
+    case DirectionExitLeft:
+        return IMG_directionExitLeft;
+    case DirectionExitRight:
+        return IMG_directionExitRight;
+    case DirectionRoundaboutRSE:
+        return IMG_directionRoundaboutRSE;
+    case DirectionRoundaboutRE:
+        return IMG_directionRoundaboutRE;
+    case DirectionRoundaboutRNE:
+        return IMG_directionRoundaboutRNE;
+    case DirectionRoundaboutRN:
+        return IMG_directionRoundaboutRN;
+    case DirectionRoundaboutRNW:
+        return IMG_directionRoundaboutRNW;
+    case DirectionRoundaboutRW:
+        return IMG_directionRoundaboutRW;
+    case DirectionRoundaboutRSW:
+        return IMG_directionRoundaboutRSW;
+    case DirectionRoundaboutRS:
+        return IMG_directionRoundaboutRS;
+    case DirectionRoundaboutLSE:
+        return IMG_directionRoundaboutLSE;
+    case DirectionRoundaboutLE:
+        return IMG_directionRoundaboutLE;
+    case DirectionRoundaboutLNE:
+        return IMG_directionRoundaboutLNE;
+    case DirectionRoundaboutLN:
+        return IMG_directionRoundaboutLN;
+    case DirectionRoundaboutLNW:
+        return IMG_directionRoundaboutLNW;
+    case DirectionRoundaboutLW:
+        return IMG_directionRoundaboutLW;
+    case DirectionRoundaboutLSW:
+        return IMG_directionRoundaboutLSW;
+    case DirectionRoundaboutLS:
+        return IMG_directionRoundaboutLS;
+    default:
+        return IMG_directionError;
+    }
+}
+
+void DrawMessage(const char *msg, int x, int y, int sz, uint16_t col)
+{
+    tft.setTextSize(sz);
+    tft.setTextColor(col, COLOR_BLACK);
+    int line = 0;
+    char buf[64];
+    strcpy(buf, msg);
+    char *token = strtok(buf, "\n");
+    while (token)
+    {
+        tft.drawString(token, x, y + line * (8 * sz + 4));
+        token = strtok(nullptr, "\n");
+        line++;
+    }
+}
+
+void DrawBottomMessage(const char *m, uint16_t col)
+{
+    int th = 16;
+    tft.fillRect(0, tft.height() - th, tft.width(), th, COLOR_BLACK);
+    DrawMessage(m, 0, tft.height() - th + 2, 2, col);
+}
+
+// ---- Funzioni di aggiornamento (delta-update) ----
+void updateSpeed(uint8_t speed)
+{
+    if (speed == lastSpeed && g_currentState == g_lastState)
+        return;
+    lastSpeed = speed;
+    int cx = tft.width() / 2;
+    int cy = tft.height() / 2 - 20; // Điều chỉnh vị trí cho màn hình ngang
+    int r = 45;                     // Giảm kích thước đồng hồ tốc độ để phù hợp với màn hình ngang
+    // Pulisci solo il cerchio
+    tft.fillCircle(cx, cy, r, COLOR_BLACK);
+    if (speed)
+    {
+        char s[4];
+        sprintf(s, "%u", speed);
+        tft.fillCircle(cx, cy, r, COLOR_RED);
+        tft.fillCircle(cx, cy, r - 6, COLOR_WHITE);
+        tft.setTextSize(6);
+        tft.setTextColor(COLOR_BLACK, COLOR_WHITE);
+        tft.setTextDatum(MC_DATUM);
+        tft.drawString(s, cx + 3, cy + 4);
+        tft.setTextDatum(TL_DATUM);
+    }
+}
+
+void updateDirection(uint8_t dir)
+{
+    if (dir == lastDir && g_currentState == g_lastState)
+        return;
+    lastDir = dir;
+    int scale = 1; // Giảm kích thước để phù hợp với màn hình ngang
+    int w = 64 * scale, h = 64 * scale;
+    int x = (tft.width() - w) / 2, y = tft.height() - h - 10; // Điều chỉnh vị trí cho màn hình ngang
+    // Pulisci solo l’area della freccia
+    tft.fillRect(x, y, w, h, COLOR_BLACK);
+    // Disegna nuova freccia
+    const uint8_t *img = ImageFromDirection(dir);
+    if (img)
+        Draw4bitImageProgmemScaled(x, y, 64, 64, img, scale);
+}
+
+// ---- BLE Callbacks ----
+class MyServerCallbacks : public BLEServerCallbacks
+{
+    void onConnect(BLEServer *pServer) override
     {
         g_deviceConnected = true;
         g_lastActivityTime = millis();
-        Serial.println("BLE Client connected");
+        g_previousState = g_currentState;
+        g_currentState = STATE_NO_ROUTE;
     }
-
-    void onDisconnect(BLEServer* pServer) override
+    void onDisconnect(BLEServer *pServer) override
     {
         g_deviceConnected = false;
+        g_previousState = g_currentState;
+        g_currentState = STATE_DISCONNECTED;
         BLEDevice::startAdvertising();
-        Serial.println("BLE Client disconnected");
     }
 };
 
-class MyCharWriteCallbacks: public BLECharacteristicCallbacks
-{
-    void onWrite(BLECharacteristic *pCharacteristic)
-    {
+class MyCharWriteCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* pCharacteristic) override {
         g_lastActivityTime = millis();
-        std::string value = pCharacteristic->getValue();
+        auto value = pCharacteristic->getValue();
+        if (value.empty()) return;
 
-        if (value.length() > 0)
+        // --- LOG RX ---
+        Serial.print("BLE RX RAW: ");
+        for (auto &c : value) Serial.printf("%02X ", (uint8_t)c);
+        Serial.println();
+        Serial.print("BLE RX ASCII: ");
+        Serial.println(value.c_str());
+
+        g_naviData = value;
+        g_previousState = g_currentState;
+
+        if (g_naviData.find("No route") != std::string::npos)
         {
-            g_naviData = value;
-            g_isNaviDataUpdated = true;
-            Serial.print("New value, length = ");
-            Serial.print(value.length());
-            Serial.print(": ");
-            for (int i = 0; i < value.length(); ++i)
+            // Ricevuto No route in qualsiasi posizione
+            if (g_previousState == STATE_NAVIGATING)
             {
-                char tmp[4] = "";
-                sprintf(tmp, "%02X ", value[i]);
-                Serial.print(tmp);
+                g_currentState = STATE_RECALCULATING;
             }
-            Serial.println();
+            else
+            {
+                g_currentState = STATE_NO_ROUTE;
+            }
+            g_isNaviDataUpdated = false;
+        }
+        else if ((uint8_t)g_naviData[0] == 1)
+        {
+            g_currentState = STATE_NAVIGATING;
+            g_isNaviDataUpdated = true;
+        }
+        else
+        {
+            Serial.println("Dati BLE non riconosciuti");
         }
     }
 };
 
-// Connect to weather server and get data - simplified
-void weatherData()
-{
-    // Thay vì lấy dữ liệu từ API, sử dụng các giá trị cố định
-    temperature = 21;        // °C
-    relative_humidity = 49;  // %
-    wind_speed_kmh = 22;     // km/h
-    pressure = 1023;         // hPa
-    data_age_min = 42359135; // min
-
-    // Minimal serial output to save memory
-    Serial.println("Weather data loaded (fixed values)");
-}
-
-// Hàm vẽ tốc độ - tương tự với BLEHUDNaviESP32
-void DrawSpeed(uint8_t speed)
-{
-    if (speed == 0)
-        return;
-
-    char str[4] = {};
-    sprintf(str, "%u", (unsigned int)speed);
-    
-    // Vẽ hình tròn làm nền cho tốc độ
-    tft.fillCircle(MAX_X/4, 30, 25, COLOR_WHITE);
-    tft.setTextColor(COLOR_BLACK);
-    
-    // Điều chỉnh vị trí dựa trên số chữ số
-    int x = MAX_X/4 - 5;
-    if (speed <= 9)
-        x = MAX_X/4 - 5;
-    else if (speed <= 99)
-        x = MAX_X/4 - 10;
-    else
-        x = MAX_X/4 - 15;
-    
-    tft.setTextSize(2);
-    tft.setCursor(x, 22);
-    tft.print(str);
-}
-
-// Hàm vẽ hướng di chuyển - tương tự với BLEHUDNaviESP32
-void DrawDirection(uint8_t direction)
-{
-    // Vẽ mũi tên dựa trên hướng
-    int centerX = 3*MAX_X/4;
-    int centerY = 30;
-    int radius = 20;
-    
-    tft.fillCircle(centerX, centerY, radius, COLOR_BLUE);
-    
-    // Vẽ mũi tên theo hướng
-    int arrowX1, arrowY1, arrowX2, arrowY2, arrowX3, arrowY3;
-    
-    switch(direction % 8) { // Giản lược để có 8 hướng cơ bản
-        case 0: // Thẳng
-            arrowX1 = centerX;
-            arrowY1 = centerY - radius;
-            arrowX2 = centerX - radius/2;
-            arrowY2 = centerY + radius/2;
-            arrowX3 = centerX + radius/2;
-            arrowY3 = centerY + radius/2;
-            break;
-        case 1: // Phải
-            arrowX1 = centerX + radius;
-            arrowY1 = centerY;
-            arrowX2 = centerX - radius/2;
-            arrowY2 = centerY - radius/2;
-            arrowX3 = centerX - radius/2;
-            arrowY3 = centerY + radius/2;
-            break;
-        case 2: // Phải gấp
-            arrowX1 = centerX + radius;
-            arrowY1 = centerY;
-            arrowX2 = centerX - radius/3;
-            arrowY2 = centerY - radius/2;
-            arrowX3 = centerX - radius/3;
-            arrowY3 = centerY + radius/2;
-            break;
-        case 3: // Quay lại phải
-            arrowX1 = centerX;
-            arrowY1 = centerY + radius;
-            arrowX2 = centerX - radius/2;
-            arrowY2 = centerY - radius/2;
-            arrowX3 = centerX + radius/2;
-            arrowY3 = centerY - radius/2;
-            break;
-        case 4: // Quay lại
-            arrowX1 = centerX - radius/2;
-            arrowY1 = centerY + radius/2;
-            arrowX2 = centerX + radius/2;
-            arrowY2 = centerY + radius/2;
-            arrowX3 = centerX;
-            arrowY3 = centerY - radius/2;
-            tft.fillCircle(centerX, centerY, radius/2, COLOR_BLUE);
-            break;
-        case 5: // Quay lại trái
-            arrowX1 = centerX;
-            arrowY1 = centerY + radius;
-            arrowX2 = centerX - radius/2;
-            arrowY2 = centerY - radius/2;
-            arrowX3 = centerX + radius/2;
-            arrowY3 = centerY - radius/2;
-            break;
-        case 6: // Trái gấp
-            arrowX1 = centerX - radius;
-            arrowY1 = centerY;
-            arrowX2 = centerX + radius/3;
-            arrowY2 = centerY - radius/2;
-            arrowX3 = centerX + radius/3;
-            arrowY3 = centerY + radius/2;
-            break;
-        case 7: // Trái
-            arrowX1 = centerX - radius;
-            arrowY1 = centerY;
-            arrowX2 = centerX + radius/2;
-            arrowY2 = centerY - radius/2;
-            arrowX3 = centerX + radius/2;
-            arrowY3 = centerY + radius/2;
-            break;
-        default:
-            return;
-    }
-    
-    tft.fillTriangle(arrowX1, arrowY1, arrowX2, arrowY2, arrowX3, arrowY3, COLOR_WHITE);
-}
-
-// This is missing in the library
-String getFormattedDate()
-{
-#define LEAP_YEAR(Y) ((Y > 0) && !(Y % 4) && ((Y % 100) || !(Y % 400)))
-    unsigned long rawTime = timeClient.getEpochTime() / 86400L;
-    unsigned long days = 0, year = 1970;
-    uint8_t month;
-    static const uint8_t monthDays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    while ((days += (LEAP_YEAR(year) ? 366 : 365)) <= rawTime)
-        year++;
-    rawTime -= days - (LEAP_YEAR(year) ? 366 : 365);
-    for (month = 0; month < 12; month++)
-    {
-        uint8_t monthLength;
-        if (month == 1)
-            monthLength = LEAP_YEAR(year) ? 29 : 28;
-        else
-            monthLength = monthDays[month];
-        if (rawTime < monthLength)
-            break;
-        rawTime -= monthLength;
-    }
-    String monthStr = ++month < 10 ? "0" + String(month) : String(month);
-    String dayStr = ++rawTime < 10 ? "0" + String(rawTime) : String(rawTime);
-    return String(dayStr) + "-" + monthStr + "-" + year;
-}
-
 void setup()
 {
-    // Entry point
     Serial.begin(115200);
-    while (!Serial)
-        delay(10);
-    Serial.println("BLENaviESP32 setup() started");
 
-    // Thu thập thông tin về ESP32
-    chipId = 0;
-    for (int i = 0; i < 17; i = i + 8)
-        chipId |= ((ESP.getEfuseMac() >> (40 - i)) & 0xff) << i;
-    
-    chipModel = ESP.getChipModel();
-    chipRevision = ESP.getChipRevision();
-    chipCores = ESP.getChipCores();
-    
-    Serial.printf("ESP32 Chip model = %s Rev %d\n", chipModel.c_str(), chipRevision);
-    Serial.printf("This chip has %d cores\n", chipCores);
-    
-    // Khởi tạo màn hình
+    // Khởi tạo backlight cho LilyGO T-Display-S3
+    pinMode(21, OUTPUT);    // TFT_BL pin từ platformio.ini
+    digitalWrite(21, HIGH); // Bật đèn nền
+
     tft.init();
-    tft.setRotation(1);        // Đặt rotation
-    tft.fillScreen(COLOR_BLACK); // Xóa màn hình
-    
-    // Khởi tạo canvas
-    canvas = new uint16_t[MAX_X * MAX_Y];
-    memset(canvas, 0, CANVAS_SIZE_BYTES);
-    
-    // Hiển thị logo hoặc màn hình khởi động
-    tft.setTextColor(COLOR_WHITE);
-    tft.setTextSize(2);
-    tft.setCursor(10, 30);
-    tft.print("ESP32 HUD Navigation");
-    tft.setCursor(10, 60);
-    tft.print("Initializing...");
-    
-    Serial.println("Display init done");
+    tft.setRotation(3); // Chuyển sang chế độ ngang phù hợp với kích thước 320x170
 
-    // Connect to WiFi
-    Serial.print("Connecting to WiFi ");
-    Serial.print(ssid);
-    Serial.print(" ");
-    
-    WiFi.begin(ssid, password);
-    int wifiTimeOutCounter = 0;
-    while (WiFi.status() != WL_CONNECTED)
-    {
-        delay(500);
-        Serial.print(".");
-        wifiTimeOutCounter++;
-        if (wifiTimeOutCounter >= 60)
-            ESP.restart();
-    }
-    
-    Serial.println("");
-    Serial.println("WiFi connected.");
-    ipAddress = WiFi.localIP().toString();
-    Serial.print("IP address: ");
-    Serial.println(ipAddress);
+    Serial.println("------------------");
+    Serial.println("Model: ESP32-D0WD-V3");
+    Serial.println("Display: ST7789 TFT Display");
+    Serial.printf("Size: %dx%d pixels\n", tft.width(), tft.height());
+    Serial.println("------------------");
 
-    uint8_t mac[6];
-    WiFi.macAddress(mac);
-    macAddress = "";
-    for (int i = 0; i < 6; i++)
-    {
-        char buf[3];
-        sprintf(buf, "%02X", mac[i]);
-        macAddress += buf;
-        if (i < 5)
-            macAddress += ":";
-    }
-    
-    // Convert MAC address to unique identifier (UID)
-    uid = ((uint64_t)mac[0] << 40) | ((uint64_t)mac[1] << 32) | ((uint64_t)mac[2] << 24) |
-          ((uint64_t)mac[3] << 16) | ((uint64_t)mac[4] << 8) | ((uint64_t)mac[5]);
+    playStartupAnimation();
 
-    // Khởi tạo BLE - giống với BLEHUDNaviESP32
-    Serial.println("BLE init started");
-    
     BLEDevice::init("ESP32 HUD");
     g_pServer = BLEDevice::createServer();
     g_pServer->setCallbacks(new MyServerCallbacks());
     BLEService *pService = g_pServer->createService(SERVICE_UUID);
 
-    // characteristic for indicate
-    {
-        uint32_t charProperties = BLECharacteristic::PROPERTY_INDICATE;
-        g_pCharIndicate = pService->createCharacteristic(CHAR_INDICATE_UUID, charProperties);
-        g_pCharIndicate->addDescriptor(new BLE2902());
-        g_pCharIndicate->setValue("");
-    }
+    g_pCharIndicate = pService->createCharacteristic(CHAR_INDICATE_UUID, BLECharacteristic::PROPERTY_INDICATE);
+    g_pCharIndicate->addDescriptor(new BLE2902());
+    g_pCharIndicate->setValue("");
 
-    // characteristic for write
-    {
-        uint32_t charProperties = BLECharacteristic::PROPERTY_WRITE;
-        BLECharacteristic *pCharWrite = pService->createCharacteristic(CHAR_WRITE_UUID, charProperties);
-        pCharWrite->setCallbacks(new MyCharWriteCallbacks());
-    }
+    BLECharacteristic *pCharWrite = pService->createCharacteristic(CHAR_WRITE_UUID, BLECharacteristic::PROPERTY_WRITE);
+    pCharWrite->setCallbacks(new MyCharWriteCallbacks());
 
     pService->start();
     BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(SERVICE_UUID);
     pAdvertising->setScanResponse(true);
-    pAdvertising->setMinPreferred(0x06);  // functions that help with iPhone connections issue
+    pAdvertising->setMinPreferred(0x06);
     pAdvertising->setMinPreferred(0x12);
     BLEDevice::startAdvertising();
-    Serial.println("BLE init done");
 
-    // Init time system
-    timeClient.begin();
-    timeClient.setTimeOffset(TIMEOFFSET);
-    
-    // Lấy thông tin thời tiết
-    weatherData();
-    
-    // Set up deep sleep functionality
-    pinMode(TTGO_LEFT_BUTTON, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(TTGO_LEFT_BUTTON), []() {
-        if (digitalRead(TTGO_LEFT_BUTTON) == LOW) {
-            g_sleepRequested = true;
-        }
-    }, FALLING);
-    
-    Serial.println("setup() finished");
-}
+    // Configurazione pulsante Deep Sleep: long click -> deep sleep
+    btnDeepSleep.setLongClickTime(1000);
+    btnDeepSleep.setLongClickDetectedHandler([](Button2 &b)
+                                             {
+    DrawBottomMessage("SLEEP", COLOR_MAGENTA);
+    // Entra subito in deep sleep
+    esp_deep_sleep_start(); });
+    btnDeepSleep.setReleasedHandler([](Button2 &b)
+                                    {
+    if (g_sleepRequested) {
+      esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+      esp_deep_sleep_start();
+    } });
 
-// Hàm chuyển đổi màu từ 4bit sang 16bit - từ BLEHUDNaviESP32
-uint16_t Color4To16bit(uint16_t color4bit)
-{
-    color4bit &= 0x0F;
-    uint16_t color16bit = 0;
-
-    const uint16_t maxColor4bit = 0x0F;
-    const uint16_t maxColor5bit = 0x1F;
-    const uint16_t maxColor6bit = 0x3F;
-    
-    const uint16_t red   = color4bit * maxColor5bit / maxColor4bit;
-    const uint16_t green = color4bit * maxColor6bit / maxColor4bit;
-    const uint16_t blue  = color4bit * maxColor5bit / maxColor4bit;
-
-    // color 16 bit: rrrrrggg gggbbbbb
-    color16bit |= red << 11;
-    color16bit |= green << 5;
-    color16bit |= blue;
-    
-    return color16bit;
-}
-
-// Hàm đặt pixel trên canvas
-void SetPixelCanvas(int16_t x, int16_t y, uint16_t value)
-{
-    if (x < 0 || y < 0 || x >= MAX_X || y >= MAX_Y)
+    if (ENABLE_VOLTAGE_MEASUREMENT)
     {
-        return;
-    }
-    canvas[y * MAX_X + x] = value;
-}
-
-// Hàm vẽ hình chữ nhật trên canvas
-void FillRect(int16_t x, int16_t y, int16_t width, int16_t height, uint16_t color)
-{
-    if (x >= MAX_X || y >= MAX_Y || width <= 0 || height <= 0)
-    {
-        return;
+        g_voltage.begin();
+        btnVol.setPressedHandler([](Button2 &)
+                                 { g_showVoltage = true; });
+        btnVol.setReleasedHandler([](Button2 &)
+                                  { g_showVoltage = false; });
     }
 
-    int16_t xStart = max(x, int16_t(0));
-    int16_t yStart = max(y, int16_t(0));
-    int16_t xEnd = min(x + width, MAX_X);
-    int16_t yEnd = min(y + height, MAX_Y);
-
-    for (int16_t y = yStart; y < yEnd; ++y)
-    {
-        for (int16_t x = xStart; x < xEnd; ++x)
-        {
-            SetPixelCanvas(x, y, color);
-        }
-    }
-}
-
-// Hàm cập nhật màn hình từ canvas
-void RedrawFromCanvas()
-{
-    tft.pushImage(0, 0, MAX_X, MAX_Y, canvas);
-}
-
-// Hàm vẽ thông báo ở cuối màn hình - tương tự BLEHUDNaviESP32
-void DrawBottomMessage(const char* msg, uint16_t color)
-{
-    const int16_t textHeight = 16;
-    const int16_t yOffset = MAX_Y - textHeight;
-    FillRect(0, yOffset, MAX_X, textHeight, COLOR_BLACK);
-    
-    // Vẽ text trực tiếp lên màn hình thay vì dùng sprite
-    tft.setTextColor(color);
-    tft.setCursor(10, yOffset);
-    tft.setTextSize(2);
-    tft.print(msg);
-}
-
-// Hàm vẽ thông điệp trên canvas
-void DrawMessage(const char* msg, int xStart, int yStart, int scale, bool overwrite, uint16_t color)
-{
-    // Vẽ text trực tiếp lên màn hình
-    tft.setTextColor(color);
-    tft.setCursor(xStart, yStart);
-    tft.setTextSize(scale);
-    tft.print(msg);
-}
-
-// Xử lý dữ liệu Navigation - tương tự với BLEHUDNaviESP32
-void HandleNaviData() {
-    if (g_isNaviDataUpdated) {
-        g_isNaviDataUpdated = false;
-        
-        std::string currentData = g_naviData;
-        if (currentData.size() > 0) {
-            memset(canvas, 0, CANVAS_SIZE_BYTES); // Clear canvas
-            
-            if (currentData[0] == 1) {
-                Serial.print("Processing navigation data: length = ");
-                Serial.println(currentData.length());
-                
-                const int speedOffset = 1;
-                const int instructionOffset = 2;
-                const int textOffset = 3;
-
-                // Display navigation text if available
-                if (currentData.length() > textOffset) {
-                    const char* text = currentData.c_str() + textOffset;
-                    const int textLen = strlen(text);
-                    int scale = 4;
-                    
-                    if (textLen > 8) {
-                        scale = 2;
-                    } else if (textLen > 6) {
-                        scale = 3;
-                    }
-                    
-                    DrawMessage(text, 10, 64, scale, true, COLOR_WHITE);
-                }
-                
-                // Display direction
-                if (currentData.length() > instructionOffset) {
-                    uint8_t direction = currentData.c_str()[instructionOffset];
-                    DrawMessage(("Direction: " + String(direction)).c_str(), 10, 30, 2, true, COLOR_WHITE);
-                }
-                
-                // Display speed
-                if (currentData.length() > speedOffset) {
-                    uint8_t speed = currentData.c_str()[speedOffset];
-                    DrawMessage(("Speed: " + String(speed) + " km/h").c_str(), 10, 10, 2, true, COLOR_WHITE);
-                }
-                
-                RedrawFromCanvas();
-            } else {
-                Serial.println("Invalid navigation data format");
-                DrawBottomMessage("Invalid data", COLOR_RED);
-            }
-        }
-    }
+    g_currentState = STATE_DISCONNECTED;
 }
 
 void loop()
 {
-    // Kiểm tra yêu cầu ngủ sâu
-    if (g_sleepRequested)
+    btnDeepSleep.loop();
+    btnVol.loop();
+
+    if (g_currentState != g_lastState)
     {
-        DrawBottomMessage("SLEEP", COLOR_MAGENTA);
-        delay(1000);
-        
-        // Chuẩn bị chế độ ngủ sâu
-        esp_sleep_enable_ext0_wakeup(GPIO_NUM_WAKEUP, 0);
-        delay(200);
-        esp_deep_sleep_start();
-        return;
-    }
-    else if (g_showVoltage)
-    {
-        // Không có chức năng đo điện áp trong ví dụ này
-        static uint64_t voltageTimeStamp = 0;
-        if (millis() - voltageTimeStamp > 1000)
+        g_sleepRequested = false;
+        switch (g_currentState)
         {
-            voltageTimeStamp = millis();
-            String voltageStr = "Batt: 3.7V";  // Giả lập giá trị pin
-            DrawBottomMessage(voltageStr.c_str(), COLOR_WHITE);
+        case STATE_DISCONNECTED:
+            showDisconnectedScreen();
+            break;
+        case STATE_NO_ROUTE:
+            showNoRouteScreen();
+            break;
+        case STATE_RECALCULATING:
+            showRecalculatingScreen();
+            break;
+        case STATE_NAVIGATING:
+            tft.fillScreen(COLOR_BLACK);
+            lastSpeed = 0xFF;
+            lastDir = 0xFF;
+            break;
+        case STATE_STARTING:
+            break;
         }
+        g_lastState = g_currentState;
     }
-    else if (g_deviceConnected)
+
+    if (g_currentState == STATE_NAVIGATING && g_isNaviDataUpdated)
     {
-        // Xử lý dữ liệu Navigation BLE
-        if (g_isNaviDataUpdated)
+        g_isNaviDataUpdated = false;
+        auto &d = g_naviData;
+        if (!d.empty() && (uint8_t)d[0] == 1)
         {
-            HandleNaviData();
-        }
-        else
-        {
-            // Gửi tín hiệu indicate định kỳ để giữ kết nối
-            uint32_t time = millis();
-            if (time - g_lastActivityTime > 4000)
+            updateSpeed(d.size() > 1 ? (uint8_t)d[1] : 0);
+            updateDirection(d.size() > 2 ? (uint8_t)d[2] : DirectionNone);
+            if (d.size() > 3)
             {
-                g_lastActivityTime = time;
-                g_pCharIndicate->indicate();
+                const char *msg = d.c_str() + 3;
+                int sz = (strlen(msg) > 8) ? 2 : 4;
+                int charH = 8 * sz + 4;
+                int my = tft.height() - charH - 10;
+                tft.fillRect(0, my, tft.width(), charH, COLOR_BLACK);
+                int msgW = strlen(msg) * 6 * sz;
+                int mx = (tft.width() - msgW) / 2;
+                DrawMessage(msg, mx, my, sz, COLOR_WHITE);
             }
         }
     }
-    else if (millis() > 3000)
+
+    if (g_showVoltage)
     {
-        // Nếu không có kết nối BLE, hiển thị thông tin hệ thống
-        static uint32_t lastInfoUpdate = 0;
-        if (millis() - lastInfoUpdate > 5000)  // Cập nhật mỗi 5 giây
+        static uint32_t vt = 0;
+        if (millis() - vt > 1000)
         {
-            lastInfoUpdate = millis();
-            
-            tft.fillScreen(COLOR_BLACK);
-            tft.setTextColor(COLOR_WHITE);
-            
-            // Hiển thị thông tin ESP32
-            tft.setTextSize(2);
-            tft.setCursor(10, 10);
-            tft.print("ESP32 HUD NAVIGATION");
-            
-            tft.drawLine(10, 30, MAX_X-10, 30, COLOR_WHITE);
-            
-            tft.setTextSize(1);
-            tft.setCursor(10, 40);
-            tft.print("Model: ");
-            tft.print(chipModel);
-            tft.print(" Rev ");
-            tft.println(chipRevision);
-            
-            tft.setCursor(10, 55);
-            tft.print("Cores: ");
-            tft.println(chipCores);
-            
-            tft.setCursor(10, 70);
-            tft.print("IP: ");
-            tft.println(ipAddress);
-            
-            tft.setCursor(10, 85);
-            tft.print("MAC: ");
-            tft.println(macAddress);
-            
-            // Hiển thị thông tin WiFi và thời tiết
-            tft.drawLine(10, 100, MAX_X-10, 100, COLOR_WHITE);
-            
-            tft.setCursor(10, 110);
-            tft.print("Weather: ");
-            tft.print(temperature);
-            tft.print("C, ");
-            tft.print(relative_humidity);
-            tft.print("%, Wind: ");
-            tft.print(wind_speed_kmh);
-            tft.println("km/h");
-            
-            // Hiển thị thông tin thời gian
-            timeClient.update();
-            tft.setCursor(10, 125);
-            tft.print("Time: ");
-            tft.println(timeClient.getFormattedTime());
-            
-            // Hiển thị trạng thái BLE
-            tft.drawLine(10, 140, MAX_X-10, 140, COLOR_WHITE);
-            tft.setCursor(10, 150);
-            tft.print("BLE Status: ");
-            tft.setTextColor(COLOR_RED);
-            tft.println("Disconnected");
-            
-            // Hiển thị hướng dẫn
-            tft.setTextColor(COLOR_WHITE);
-            tft.setCursor(10, MAX_Y-15);
-            tft.print("Waiting for BLE connection...");
-            
-            Serial.println("Disconnected - waiting for BLE connection");
+            vt = millis();
+            char vs[16];
+            sprintf(vs, "%.2f V", g_voltage.measureVolts());
+            DrawBottomMessage(vs, COLOR_WHITE);
         }
     }
-    
+    else if (!g_sleepRequested && g_deviceConnected) {
+        if (millis() - g_lastActivityTime > 4000) {
+            g_lastActivityTime = millis();
+            // --- LOG TX ---
+            Serial.print("BLE TX Indicate (current naviData): ");
+            Serial.println(g_naviData.c_str());
+            g_pCharIndicate->setValue(g_naviData);
+            g_pCharIndicate->indicate();
+        }
+    }
+
     delay(10);
 }
