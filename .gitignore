@@ -1,0 +1,18 @@
+# Thư mục build của PlatformIO
+.pio/
+.pioenvs/
+
+# Các file nhị phân do PlatformIO/Arduino sinh ra
+*.elf
+*.bin
+*.hex
+*.eep
+*.map
+
+# Thư mục và file của VSCode (tuỳ chọn)
+.vscode/
+
+# File hệ thống macOS
+.DS_Store
+
+# File log
