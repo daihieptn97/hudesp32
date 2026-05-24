@@ -1,44 +1,26 @@
 /**
- * ESP32 Car HUD - BLE Receiver + ST7789 Display (v2)
+ * ESP32 Car HUD - BLE Receiver + ST7789 Display (v3)
  *
- * Fixes vs v1:
- *   1. Distance unit (m / km) is now drawn next to the number.
- *   2. Arrow type string is normalized (accepts "right", "turn-right",
- *      "TURN_RIGHT", "0", etc.) and "left" / "uturn" now render correctly.
- *      Unknown arrows fall back to a "?" badge in WARN color (not NAV green)
- *      so it is obvious something is wrong, and the raw value is logged.
- *   3. Nav layout reworked so long street names fit:
- *        - Arrow on the left (compact, 32 px radius zone)
- *        - Distance + unit on a single line, mid-size font
- *        - Street name in 2 lines, smaller font, with word-wrap
- *        - Automatic abbreviation of common Vietnamese phrases
- *          ("Đến nơi lúc" -> "ETA", "Rẽ phải vào" -> "R:" ...) when
- *          the text still overflows after wrapping.
+ * Changes vs v2:
+ *   1. NAV layout split 40/60 vertically:
+ *        - Left 40% (0..128 px)  : large speed readout
+ *        - Right 60% (128..320)  : arrow + distance + street name
+ *      A 1-pixel divider separates the two zones.
+ *   2. Distance formatting:
+ *        - Phone may send distance either in meters (recommended) or in
+ *          km. ESP32 normalizes and prints with 1 decimal place when in
+ *          km range, e.g. "850 m", "1.3 km", "5.6 km".
+ *        - Protocol "cách A" (recommended): app always sends
+ *          { "t":"nav", "arr":"...", "d": <meters int>, "s":"..." }.
+ *          The "u" field is ignored / optional. Below 1000m -> "N m",
+ *          1000m and above -> "X.Y km".
+ *        - Fallback "cách B": if app explicitly sends "u":"km", the "d"
+ *          value is treated as a float in km. JSON parser supports both
+ *          integer and float for "d".
+ *   3. IDLE page: large centered speed when fresh data is available;
+ *      otherwise the "Car HUD Ready" splash remains.
  *
  * Compatible with: Arduino-ESP32 core 2.x + NimBLE-Arduino 1.4.x + ArduinoJson 6.x
- *
- * Build:
- *   - PlatformIO: place this file in `src/` of an espressif32 project.
- *     Example platformio.ini:
- *
- *       [env:esp32-s3]
- *       platform     = espressif32
- *       board        = esp32-s3-devkitc-1
- *       framework    = arduino
- *       monitor_speed = 115200
- *       lib_deps =
- *           bodmer/TFT_eSPI@^2.5.43
- *           h2zero/NimBLE-Arduino@^1.4.2
- *           bblanchon/ArduinoJson@^6.21.5
- *
- *   - Arduino IDE: rename back to .ino (Arduino auto-generates forward
- *     declarations and #include <Arduino.h>; .cpp users do it manually,
- *     which is why this file does both explicitly).
- *
- * BLE Service:
- *   Service UUID:        6e400001-b5a3-f393-e0a9-e50e24dcca9e
- *   RX Characteristic:   6e400002-b5a3-f393-e0a9-e50e24dcca9e (WRITE)
- *   TX Characteristic:   6e400003-b5a3-f393-e0a9-e50e24dcca9e (NOTIFY)
  */
 
 #include <Arduino.h>
@@ -47,21 +29,22 @@
 #include <NimBLEDevice.h>
 #include <ctype.h>
 #include <string.h>
+#include <math.h>
 
 // ============================================================
 //  Forward declarations
-//  (Arduino IDE auto-generates these for .ino files; in a plain
-//  .cpp we list them explicitly so call-order between functions
-//  is not fragile.)
 // ============================================================
 enum ArrowType : int;
 static void  str_canon(const char* in, char* out, size_t outSize);
 static ArrowType parseArrow(const char* raw);
+static void  formatDistance(float meters, bool unitIsKm,
+                            char* out, size_t outSize);
 void  handleJsonMessage(const std::string& raw);
 static void  drawShaft(int cx, int cy, int len, int thick, uint16_t color);
 void  drawArrowShape(ArrowType type, int cx, int cy, int s, uint16_t color);
 void  drawTopBar();
 void  drawBottomBar();
+void  drawSpeedPanel(int x, int y, int w, int h);
 void  drawPageIdle();
 static bool  abbreviateStreet(char* s, size_t n);
 static void  wrapTwoLines(const char* text, int maxW,
@@ -103,6 +86,11 @@ TFT_eSPI tft = TFT_eSPI();
 const int SCREEN_W = 320;
 const int SCREEN_H = 170;
 
+// 40/60 vertical split for the NAV page content area
+const int SPLIT_X      = 128;            // 40% of 320
+const int CONTENT_Y    = 18;
+const int CONTENT_H    = SCREEN_H - 22 - 18;  // 130
+
 // ============================================================
 //  State machine
 // ============================================================
@@ -113,7 +101,6 @@ enum Page {
     PAGE_SMS  = 3
 };
 
-// Normalized arrow types — handler converts raw string to this
 enum ArrowType : int {
     ARR_NONE = 0,
     ARR_STRAIGHT,
@@ -125,15 +112,14 @@ enum ArrowType : int {
     ARR_SHARP_LEFT,
     ARR_UTURN_LEFT,
     ARR_UTURN_RIGHT,
-    ARR_ARRIVE,      // "destination" / "arrived"
+    ARR_ARRIVE,
     ARR_UNKNOWN
 };
 
 struct StateData {
     ArrowType nav_arrow      = ARR_NONE;
-    char nav_arrow_raw[16]   = "";   // kept for debug
-    int  nav_dist            = 0;
-    char nav_unit[4]         = "m";
+    char nav_arrow_raw[16]   = "";
+    float nav_dist_m         = 0.0f;   // ALWAYS stored as meters internally
     char nav_street[64]      = "";
     unsigned long nav_until  = 0;
 
@@ -163,6 +149,11 @@ Page currentPage   = PAGE_IDLE;
 Page lastDrawnPage = (Page)(-1);
 bool needsRedraw   = true;
 
+// Track previous speed value separately so we can repaint just the
+// speed panel without redrawing the whole NAV page every second.
+int  lastDrawnSpeed = -2;
+bool lastSpeedFresh = false;
+
 const unsigned long NAV_TIMEOUT  = 60000;
 const unsigned long CALL_TIMEOUT = 30000;
 const unsigned long SMS_TIMEOUT  = 15000;
@@ -175,9 +166,6 @@ NimBLEServer*         pServer = nullptr;
 
 // ============================================================
 //  Arrow string normalization
-//  Accepts many spellings so the phone app does not have to
-//  match an exact constant. All comparisons are lowercase and
-//  ignore '_', '-', ' '.
 // ============================================================
 static void str_canon(const char* in, char* out, size_t outSize) {
     size_t j = 0;
@@ -195,7 +183,6 @@ static ArrowType parseArrow(const char* raw) {
     char k[24];
     str_canon(raw, k, sizeof(k));
 
-    // exact tokens used by typical nav SDKs (Google, Mapbox, OSRM)
     if (!strcmp(k, "straight") || !strcmp(k, "up") ||
         !strcmp(k, "continue") || !strcmp(k, "forward") ||
         !strcmp(k, "depart"))                            return ARR_STRAIGHT;
@@ -223,6 +210,35 @@ static ArrowType parseArrow(const char* raw) {
         !strcmp(k, "destination") || !strcmp(k, "end"))   return ARR_ARRIVE;
 
     return ARR_UNKNOWN;
+}
+
+// ============================================================
+//  Distance formatting
+//  Input: distance in meters (float). Outputs strings like:
+//      "0 m", "5 m", "950 m", "1.0 km", "1.3 km", "12.4 km", "999 km"
+//  Rules:
+//    - meters < 1000 -> integer meters + " m"
+//    - meters >= 1000 -> km with exactly 1 decimal (dot, not comma)
+//    - meters < 0 or NaN -> "-- m"
+// ============================================================
+static void formatDistance(float meters, bool /*unitIsKm*/,
+                           char* out, size_t outSize) {
+    if (out == nullptr || outSize == 0) return;
+    if (isnan(meters) || meters < 0.0f) {
+        strlcpy(out, "-- m", outSize);
+        return;
+    }
+    if (meters < 1000.0f) {
+        int m = (int)(meters + 0.5f);
+        snprintf(out, outSize, "%d m", m);
+    } else {
+        // round to 1 decimal in km
+        float km = meters / 1000.0f;
+        // avoid showing "1000.0 km" for huge values — cap visually
+        if (km >= 9999.0f) km = 9999.0f;
+        // snprintf with %.1f uses the C locale (dot), which is what we want.
+        snprintf(out, outSize, "%.1f km", km);
+    }
 }
 
 // ============================================================
@@ -269,8 +285,18 @@ void handleJsonMessage(const std::string& raw) {
         if (st.nav_arrow == ARR_UNKNOWN) {
             Serial.printf("[NAV] Unknown arrow string: '%s'\n", arrRaw);
         }
-        st.nav_dist =          doc["d"]  | 0;
-        strlcpy(st.nav_unit,   doc["u"]  | "m", sizeof(st.nav_unit));
+
+        // Distance: accept either integer meters (recommended) or
+        // a float that may be in meters OR kilometers depending on "u".
+        // Internally we always store meters.
+        const char* unitRaw = doc["u"] | "m";
+        float rawDist = doc["d"] | 0.0f;
+        if (unitRaw && (unitRaw[0] == 'k' || unitRaw[0] == 'K')) {
+            st.nav_dist_m = rawDist * 1000.0f;
+        } else {
+            st.nav_dist_m = rawDist;
+        }
+
         strlcpy(st.nav_street, doc["s"]  | "",  sizeof(st.nav_street));
         st.nav_until = now + NAV_TIMEOUT;
         currentPage = PAGE_NAV;
@@ -326,8 +352,7 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
 };
 
 // ============================================================
-//  Arrow drawing — vector-based, no font hacks
-//  Each shape is drawn inside a (2s x 2s) box centered at (cx, cy).
+//  Arrow drawing — unchanged from v2
 // ============================================================
 static void drawShaft(int cx, int cy, int len, int thick, uint16_t color) {
     tft.fillRect(cx - thick / 2, cy - len / 2, thick, len, color);
@@ -336,7 +361,6 @@ static void drawShaft(int cx, int cy, int len, int thick, uint16_t color) {
 void drawArrowShape(ArrowType type, int cx, int cy, int s, uint16_t color) {
     switch (type) {
         case ARR_RIGHT: {
-            // shaft pointing right
             tft.fillRect(cx - s, cy - s / 4, s + s / 3, s / 2, color);
             tft.fillTriangle(cx + s / 3, cy - s,
                              cx + s / 3, cy + s,
@@ -358,11 +382,9 @@ void drawArrowShape(ArrowType type, int cx, int cy, int s, uint16_t color) {
             break;
         }
         case ARR_SLIGHT_RIGHT: {
-            // diagonal up-right shaft + head
             tft.fillTriangle(cx - s / 2, cy + s,
                              cx + s,     cy - s / 2,
                              cx + s / 2, cy - s / 4 + s / 4, color);
-            // head: small triangle at the top-right
             tft.fillTriangle(cx + s,     cy - s,
                              cx + s / 4, cy - s / 2,
                              cx + s,     cy - s / 4, color);
@@ -378,7 +400,6 @@ void drawArrowShape(ArrowType type, int cx, int cy, int s, uint16_t color) {
             break;
         }
         case ARR_SHARP_RIGHT: {
-            // L-shape: short vertical going up, then strong right turn
             tft.fillRect(cx - s / 4, cy - s / 8, s / 2, s + s / 8, color);
             tft.fillRect(cx - s / 4, cy - s / 8, s, s / 2, color);
             tft.fillTriangle(cx + s - s / 8, cy - s / 2,
@@ -395,18 +416,15 @@ void drawArrowShape(ArrowType type, int cx, int cy, int s, uint16_t color) {
             break;
         }
         case ARR_UTURN_LEFT: {
-            // come up from the bottom-right, loop over the top, point down-left
-            tft.fillRect(cx + s / 3,        cy - s / 4, s / 3, s + s / 4, color);     // right vertical
-            tft.fillRect(cx - s / 2,        cy - s,     s + s / 6, s / 3, color);     // top horizontal
-            tft.fillRect(cx - s / 2,        cy - s,     s / 3, s / 2 + s / 8, color); // left vertical (short)
-            // head pointing down-left
+            tft.fillRect(cx + s / 3,        cy - s / 4, s / 3, s + s / 4, color);
+            tft.fillRect(cx - s / 2,        cy - s,     s + s / 6, s / 3, color);
+            tft.fillRect(cx - s / 2,        cy - s,     s / 3, s / 2 + s / 8, color);
             tft.fillTriangle(cx - s / 2 - s / 3, cy - s / 8,
                              cx - s / 2 + s / 3, cy - s / 8,
                              cx - s / 6,         cy + s / 2, color);
             break;
         }
         case ARR_UTURN_RIGHT: {
-            // mirror of UTURN_LEFT
             tft.fillRect(cx - s / 3 - s / 3, cy - s / 4, s / 3, s + s / 4, color);
             tft.fillRect(cx - s / 3,         cy - s,     s + s / 6, s / 3, color);
             tft.fillRect(cx + s / 6,         cy - s,     s / 3, s / 2 + s / 8, color);
@@ -416,10 +434,8 @@ void drawArrowShape(ArrowType type, int cx, int cy, int s, uint16_t color) {
             break;
         }
         case ARR_ARRIVE: {
-            // flag / checkered destination marker
             drawShaft(cx, cy + s / 4, s + s / 2, s / 6, color);
             tft.fillRect(cx, cy - s, s, s / 2 + s / 4, color);
-            // checker squares (dark holes)
             int sq = s / 5;
             tft.fillRect(cx + sq,     cy - s + sq, sq, sq, COLOR_BG);
             tft.fillRect(cx + 3 * sq, cy - s + sq, sq, sq, COLOR_BG);
@@ -428,7 +444,6 @@ void drawArrowShape(ArrowType type, int cx, int cy, int s, uint16_t color) {
             break;
         }
         default: {
-            // unknown / none: red badge with "?"
             tft.fillCircle(cx, cy, s, COLOR_WARN);
             tft.setTextColor(COLOR_FG, COLOR_WARN);
             tft.setTextFont(4);
@@ -470,17 +485,22 @@ void drawBottomBar() {
     unsigned long now = millis();
     char buf[16];
 
-    // speed
+    // On NAV page the speed is already shown big on the left panel,
+    // so the bottom bar shows only clock + battery (cleaner).
     tft.setTextFont(2);
-    if (st.speed_kmh >= 0 && (now - st.speed_ts < SPEED_STALE)) {
-        tft.setTextColor(COLOR_SPEED, COLOR_BG);
-        snprintf(buf, sizeof(buf), "%d km/h", st.speed_kmh);
-    } else {
-        tft.setTextColor(COLOR_DIM, COLOR_BG);
-        snprintf(buf, sizeof(buf), "-- km/h");
+
+    if (currentPage != PAGE_NAV) {
+        // speed (left)
+        if (st.speed_kmh >= 0 && (now - st.speed_ts < SPEED_STALE)) {
+            tft.setTextColor(COLOR_SPEED, COLOR_BG);
+            snprintf(buf, sizeof(buf), "%d km/h", st.speed_kmh);
+        } else {
+            tft.setTextColor(COLOR_DIM, COLOR_BG);
+            snprintf(buf, sizeof(buf), "-- km/h");
+        }
+        tft.setCursor(8, barY + 3);
+        tft.print(buf);
     }
-    tft.setCursor(8, barY + 3);
-    tft.print(buf);
 
     // clock (centered)
     if (st.clk_hour >= 0 && (now - st.clk_ts < CLOCK_STALE)) {
@@ -508,56 +528,136 @@ void drawBottomBar() {
     tft.print(buf);
 }
 
-void drawPageIdle() {
-    int contentY = 18;
-    int contentH = SCREEN_H - 22 - 18;
-    tft.fillRect(0, contentY, SCREEN_W, contentH, COLOR_BG);
+// ============================================================
+//  Speed panel (used on the NAV page, left 40%)
+//  Draws inside the given rectangle. Repaints only this area.
+//
+//  Font sizing:
+//    - Number: font 7 (7-seg, ~48px) at setTextSize(2) -> ~96px tall.
+//      This is the biggest the digits can be without exceeding the
+//      128 px wide / 130 px tall panel. For 3-digit speeds (e.g. 120)
+//      the width at size 2 is roughly 3 * 30px*2 = ~180px which would
+//      NOT fit, so we auto-fall-back to size 1 when there are 3+ digits.
+//    - Unit "km/h": font 4 (~26px) instead of font 2 so it scales up
+//      with the number.
+// ============================================================
+void drawSpeedPanel(int x, int y, int w, int h) {
+    tft.fillRect(x, y, w, h, COLOR_BG);
 
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.setTextFont(4);
-    const char* msg1 = "Car HUD Ready";
-    int w1 = tft.textWidth(msg1);
-    tft.setCursor((SCREEN_W - w1) / 2, contentY + 25);
-    tft.print(msg1);
+    unsigned long now = millis();
+    bool fresh = (st.speed_kmh >= 0) && (now - st.speed_ts < SPEED_STALE);
 
-    tft.setTextFont(2);
-    const char* msg2 = st.ble_connected
-                         ? "Waiting for data..."
-                         : "Connect from your phone";
-    int w2 = tft.textWidth(msg2);
-    tft.setCursor((SCREEN_W - w2) / 2, contentY + 70);
-    tft.print(msg2);
+    char numBuf[8];
+    if (fresh) {
+        snprintf(numBuf, sizeof(numBuf), "%d", st.speed_kmh);
+        tft.setTextColor(COLOR_SPEED, COLOR_BG);
+    } else {
+        strlcpy(numBuf, "--", sizeof(numBuf));
+        tft.setTextColor(COLOR_DIM, COLOR_BG);
+    }
+
+    // Try size 2 first (biggest). If too wide for the panel, fall back
+    // to size 1. Reserve a small horizontal margin so digits don't kiss
+    // the divider line.
+    const int hMargin = 4;
+    tft.setTextFont(7);
+    tft.setTextSize(2);
+    int numW = tft.textWidth(numBuf);
+    int numH = 96;  // font 7 (~48px) * size 2
+    int unitFont = 4;
+    int unitGap  = 6;
+
+    if (numW > w - hMargin * 2) {
+        // Fallback for 3-digit speeds: size 1 (still uses font 7)
+        tft.setTextSize(1);
+        numW = tft.textWidth(numBuf);
+        numH = 48;
+        unitFont = 4;
+        unitGap  = 4;
+    }
+
+    // Unit height contributes to vertical centering
+    tft.setTextFont(unitFont);
+    int unitH = tft.fontHeight();
+    int blockH = numH + unitGap + unitH;
+    int blockY = y + (h - blockH) / 2;
+
+    // Draw number
+    tft.setTextFont(7);
+    int numX = x + (w - numW) / 2;
+    int numY = blockY;
+    tft.setCursor(numX, numY);
+    tft.print(numBuf);
+
+    // Restore size 1 for non-speed drawing elsewhere
+    tft.setTextSize(1);
+
+    // Draw unit label below
+    tft.setTextFont(unitFont);
+    tft.setTextColor(fresh ? COLOR_ACCENT : COLOR_DIM, COLOR_BG);
+    const char* unit = "km/h";
+    int uW = tft.textWidth(unit);
+    tft.setCursor(x + (w - uW) / 2, numY + numH + unitGap);
+    tft.print(unit);
+
+    lastDrawnSpeed = st.speed_kmh;
+    lastSpeedFresh = fresh;
 }
 
 // ============================================================
-//  Nav page — re-laid-out
-//
-//  Layout (320 x 130 content area, between top bar y=18 and
-//  bottom bar y=148):
-//
-//   +-------------------------------------------------+ 18
-//   |          |                                      |
-//   |          |   320 m                              |
-//   |  ARROW   |   --------------------------------   |
-//   |          |   Den noi luc 09:35                  |
-//   |          |   Nguyen Trai                        |
-//   +-------------------------------------------------+ 148
-//
-//   Arrow zone:  x = 0..95,   centered at (48, 83), size = 32
-//   Distance:    x = 100,     y = 30,  font 6 (digits) + font 4 (unit)
-//   Street:      x = 100,     y = 78,  font 2, 2 lines max, with
-//                wrap on word boundary and Vietnamese-aware
-//                abbreviation if it still doesn't fit.
+//  IDLE page — speed big in center when available
 // ============================================================
+void drawPageIdle() {
+    tft.fillRect(0, CONTENT_Y, SCREEN_W, CONTENT_H, COLOR_BG);
 
-// Abbreviate common long phrases on overflow.
-// Returns true if anything was changed.
+    unsigned long now = millis();
+    bool fresh = (st.speed_kmh >= 0) && (now - st.speed_ts < SPEED_STALE);
+
+    if (fresh) {
+        // Huge centered speed
+        char numBuf[8];
+        snprintf(numBuf, sizeof(numBuf), "%d", st.speed_kmh);
+        tft.setTextFont(7);
+        tft.setTextColor(COLOR_SPEED, COLOR_BG);
+        int numW = tft.textWidth(numBuf);
+        tft.setCursor((SCREEN_W - numW) / 2, CONTENT_Y + 20);
+        tft.print(numBuf);
+
+        tft.setTextFont(4);
+        tft.setTextColor(COLOR_ACCENT, COLOR_BG);
+        const char* unit = "km/h";
+        int uW = tft.textWidth(unit);
+        tft.setCursor((SCREEN_W - uW) / 2, CONTENT_Y + 85);
+        tft.print(unit);
+    } else {
+        tft.setTextColor(COLOR_DIM, COLOR_BG);
+        tft.setTextFont(4);
+        const char* msg1 = "Car HUD Ready";
+        int w1 = tft.textWidth(msg1);
+        tft.setCursor((SCREEN_W - w1) / 2, CONTENT_Y + 25);
+        tft.print(msg1);
+
+        tft.setTextFont(2);
+        const char* msg2 = st.ble_connected
+                             ? "Waiting for data..."
+                             : "Connect from your phone";
+        int w2 = tft.textWidth(msg2);
+        tft.setCursor((SCREEN_W - w2) / 2, CONTENT_Y + 70);
+        tft.print(msg2);
+    }
+
+    lastDrawnSpeed = st.speed_kmh;
+    lastSpeedFresh = fresh;
+}
+
+// ============================================================
+//  Street-name helpers — unchanged from v2
+// ============================================================
 static bool abbreviateStreet(char* s, size_t n) {
     struct Sub { const char* from; const char* to; };
     static const Sub subs[] = {
-        // Vietnamese (raw ASCII — many phones strip diacritics anyway)
-        { "Den noi luc",   "ETA"   },
-        { "den noi luc",   "ETA"   },
+        { "Den noi luc",   "EAT"   },
+        { "den noi luc",   "EAT"   },
         { "Re phai vao",   "R:"    },
         { "Re trai vao",   "L:"    },
         { "Re phai",       "R"     },
@@ -567,7 +667,6 @@ static bool abbreviateStreet(char* s, size_t n) {
         { "Duong",         "D."    },
         { "Pho",           "P."    },
         { "Quan",          "Q."    },
-        // English / generic
         { "Continue on",   "Cont." },
         { "Turn right onto", "R:"  },
         { "Turn left onto",  "L:"  },
@@ -596,9 +695,6 @@ static bool abbreviateStreet(char* s, size_t n) {
     return changed;
 }
 
-// Split `text` into up to 2 lines that each fit within maxW pixels using
-// current font. Word-breaks where possible. Truncates with ".." if even
-// 2 lines aren't enough.
 static void wrapTwoLines(const char* text, int maxW,
                          char* line1, size_t l1Size,
                          char* line2, size_t l2Size) {
@@ -606,7 +702,6 @@ static void wrapTwoLines(const char* text, int maxW,
     line2[0] = '\0';
     if (!text || !*text) return;
 
-    // line 1: greedy word fit
     char buf[160];
     strlcpy(buf, text, sizeof(buf));
 
@@ -632,12 +727,10 @@ static void wrapTwoLines(const char* text, int maxW,
 
     if (cut >= len) return;
 
-    // line 2: rest, possibly truncated
     const char* rest = text + cut;
     while (*rest == ' ') rest++;
     strlcpy(line2, rest, l2Size);
 
-    // truncate line2 with ".." if too wide
     while (tft.textWidth(line2) > maxW && strlen(line2) > 2) {
         size_t L = strlen(line2);
         line2[L - 1] = '\0';
@@ -649,73 +742,174 @@ static void wrapTwoLines(const char* text, int maxW,
     }
 }
 
+// ============================================================
+//  NAV page — 40/60 split
+//
+//  Layout:
+//    Left zone  (x: 0..127, w=128) : speed panel (drawSpeedPanel)
+//    Divider    (x: 128, 1 px)     : vertical line in COLOR_DIM
+//    Right zone (x: 129..319, w=191) : arrow + distance + street
+//
+//  Right zone breakdown (Y inside CONTENT area, height 130):
+//    Arrow:    cx = 129 + 30 = 159, cy = CONTENT_Y + 32, size = 26
+//    Distance: x = 129 + 64, y = CONTENT_Y + 8  (font 6 number + font 4 unit)
+//    Street:   x = 129 + 8,  y = CONTENT_Y + 78 (font 2, up to 2 lines)
+// ============================================================
 void drawPageNav() {
-    int contentY = 18;
-    int contentH = SCREEN_H - 22 - 18;  // 130
-    tft.fillRect(0, contentY, SCREEN_W, contentH, COLOR_BG);
+    // Wipe content area
+    tft.fillRect(0, CONTENT_Y, SCREEN_W, CONTENT_H, COLOR_BG);
 
-    // ---- Arrow (left zone, 0..95) ----
-    const int arrowCX = 48;
-    const int arrowCY = contentY + contentH / 2;  // 83
-    const int arrowS  = 32;
+    // Vertical divider between speed (left) and nav (right)
+    tft.drawFastVLine(SPLIT_X, CONTENT_Y, CONTENT_H, COLOR_DIM);
+
+    // ---- Left: speed panel ----
+    drawSpeedPanel(0, CONTENT_Y, SPLIT_X, CONTENT_H);
+
+    // ---- Right: arrow ----
+    const int rightX  = SPLIT_X + 1;
+    const int rightW  = SCREEN_W - rightX;             // 191
+    const int arrowCX = rightX + 32;
+    const int arrowCY = CONTENT_Y + 36;
+    const int arrowS  = 26;
 
     uint16_t arrowColor = (st.nav_arrow == ARR_UNKNOWN || st.nav_arrow == ARR_NONE)
                            ? COLOR_WARN : COLOR_NAV;
     drawArrowShape(st.nav_arrow, arrowCX, arrowCY, arrowS, arrowColor);
 
-    // ---- Distance + unit (single line) ----
-    const int textX  = 100;
-    char distNum[16];
-    snprintf(distNum, sizeof(distNum), "%d", st.nav_dist);
+    // ---- Right: distance + unit ----
+    char distStr[16];
+    formatDistance(st.nav_dist_m, false, distStr, sizeof(distStr));
 
-    // Font 6: digits/colon only, large. Use it for the number.
+    // Split into <number> and <unit> so we can render at two sizes.
+    // distStr looks like "850 m" or "1.3 km" — split at the space.
+    char distNum[12] = "";
+    char distUnit[6] = "";
+    {
+        const char* sp = strchr(distStr, ' ');
+        if (sp) {
+            size_t nlen = (size_t)(sp - distStr);
+            if (nlen >= sizeof(distNum)) nlen = sizeof(distNum) - 1;
+            memcpy(distNum, distStr, nlen);
+            distNum[nlen] = '\0';
+            strlcpy(distUnit, sp + 1, sizeof(distUnit));
+        } else {
+            strlcpy(distNum, distStr, sizeof(distNum));
+        }
+    }
+
+    const int distAreaX = rightX + 64;  // to the right of the arrow
     tft.setTextColor(COLOR_FG, COLOR_BG);
-    tft.setTextFont(6);
-    int numY = contentY + 12;
-    tft.setCursor(textX, numY);
-    tft.print(distNum);
-    int numW = tft.textWidth(distNum);
 
-    // Font 4: regular text, for the unit. Place right after the number.
+    // Pick font for number: font 6 is digits + ':' + '.' only (perfect
+    // for "1.3"). Verify width fits in the right zone.
+    tft.setTextFont(6);
+    int numW = tft.textWidth(distNum);
+    int numY = CONTENT_Y + 8;
+
+    // If width is borderline (long km values like "999.9"), drop down a
+    // size to font 4 instead so it never clips the screen edge.
+    int unitGap = 6;
+    int needW = numW + unitGap + 30;  // approx unit width with font 4
+    if (rightX + (distAreaX - rightX) + needW > SCREEN_W - 4) {
+        tft.setTextFont(4);
+        numW = tft.textWidth(distNum);
+        numY = CONTENT_Y + 16;
+    }
+    tft.setCursor(distAreaX, numY);
+    tft.print(distNum);
+
+    // Unit text — baseline-align with the bottom of the big number
     tft.setTextFont(4);
     tft.setTextColor(COLOR_ACCENT, COLOR_BG);
-    // font 6 is taller (~48px) than font 4 (~26px); baseline-align by adding offset
-    int unitY = numY + 22;
-    tft.setCursor(textX + numW + 6, unitY);
-    tft.print(st.nav_unit);
+    int unitY = numY + 22;  // ~baseline offset from font 6 top
+    tft.setCursor(distAreaX + numW + unitGap, unitY);
+    tft.print(distUnit);
 
-    // ---- Street name (up to 2 lines) ----
-    tft.setTextFont(2);
-    tft.setTextColor(COLOR_ACCENT, COLOR_BG);
+    // ---- Right: street name (2 lines max) ----
+    //
+    // If the text looks like an ETA line (contains "Den noi luc", "den
+    // noi luc", "EAT", or "ETA"), render it in a bigger font (font 4,
+    // ~26px) and as a single line, since ETA strings are short like
+    // "EAT 09:35" or "Den noi luc 09:35". Otherwise use the normal
+    // font 2 two-line layout for street names.
+    //
+    // The text is also shifted down ~2px (offset 80 instead of 78) per
+    // the user request.
+    int streetX    = rightX + 8;
+    int streetMaxW = SCREEN_W - streetX - 6;  // available width
 
-    int streetMaxW = SCREEN_W - textX - 8;  // available width: ~212 px
     char working[96];
     strlcpy(working, st.nav_street, sizeof(working));
 
-    // First try direct wrap. If line2 ends up truncated, abbreviate and re-wrap.
-    char l1[64], l2[64];
-    wrapTwoLines(working, streetMaxW, l1, sizeof(l1), l2, sizeof(l2));
+    // Case-insensitive search for any ETA marker
+    auto containsCI = [](const char* hay, const char* needle) -> bool {
+        if (!hay || !needle || !*needle) return false;
+        size_t nlen = strlen(needle);
+        for (const char* p = hay; *p; p++) {
+            size_t i = 0;
+            for (; i < nlen; i++) {
+                if (tolower((unsigned char)p[i]) !=
+                    tolower((unsigned char)needle[i])) break;
+            }
+            if (i == nlen) return true;
+        }
+        return false;
+    };
 
-    bool overflowed = (strstr(l2, "..") != nullptr);
-    if (overflowed && abbreviateStreet(working, sizeof(working))) {
+    bool isEta = containsCI(working, "den noi luc") ||
+                 containsCI(working, "EAT") ||
+                 containsCI(working, "ETA");
+
+    int streetY = CONTENT_Y + 80;   // shifted down 2px (was 78)
+
+    if (isEta) {
+        // Bigger font, single line, with abbreviation + truncation fallback
+        tft.setTextFont(4);
+        tft.setTextColor(COLOR_ACCENT, COLOR_BG);
+
+        // Apply abbreviation table first so "Den noi luc 09:35" becomes
+        // "EAT 09:35" and fits comfortably.
+        abbreviateStreet(working, sizeof(working));
+
+        // Truncate if still too wide
+        while (tft.textWidth(working) > streetMaxW && strlen(working) > 2) {
+            size_t L = strlen(working);
+            working[L - 1] = '\0';
+            if (L >= 3) {
+                working[L - 3] = '.';
+                working[L - 2] = '.';
+                working[L - 1] = '\0';
+            }
+        }
+        tft.setCursor(streetX, streetY);
+        tft.print(working);
+    } else {
+        // Normal street name: font 2, up to 2 lines, with abbreviation
+        // fallback if overflowed.
+        tft.setTextFont(2);
+        tft.setTextColor(COLOR_ACCENT, COLOR_BG);
+
+        char l1[64], l2[64];
         wrapTwoLines(working, streetMaxW, l1, sizeof(l1), l2, sizeof(l2));
-    }
 
-    int streetY = contentY + 78;
-    tft.setCursor(textX, streetY);
-    tft.print(l1);
-    if (l2[0]) {
-        tft.setCursor(textX, streetY + 18);
-        tft.print(l2);
+        bool overflowed = (strstr(l2, "..") != nullptr);
+        if (overflowed && abbreviateStreet(working, sizeof(working))) {
+            wrapTwoLines(working, streetMaxW, l1, sizeof(l1), l2, sizeof(l2));
+        }
+
+        tft.setCursor(streetX, streetY);
+        tft.print(l1);
+        if (l2[0]) {
+            tft.setCursor(streetX, streetY + 18);
+            tft.print(l2);
+        }
     }
 }
 
 void drawPageCall() {
-    int contentY = 18;
-    int contentH = SCREEN_H - 22 - 18;
-    tft.fillRect(0, contentY, SCREEN_W, contentH, COLOR_BG);
+    tft.fillRect(0, CONTENT_Y, SCREEN_W, CONTENT_H, COLOR_BG);
 
-    int icx = 50, icy = contentY + 50;
+    int icx = 50, icy = CONTENT_Y + 50;
     tft.fillCircle(icx, icy, 26, COLOR_CALL);
     tft.fillCircle(icx, icy, 20, COLOR_BG);
     tft.fillRoundRect(icx - 12, icy - 4, 24, 12, 4, COLOR_CALL);
@@ -724,7 +918,7 @@ void drawPageCall() {
 
     tft.setTextColor(COLOR_FG, COLOR_BG);
     tft.setTextFont(4);
-    tft.setCursor(100, contentY + 18);
+    tft.setCursor(100, CONTENT_Y + 18);
     char nameBuf[32];
     strlcpy(nameBuf, st.call_name, sizeof(nameBuf));
     while (tft.textWidth(nameBuf) > (SCREEN_W - 100 - 8) && strlen(nameBuf) > 3) {
@@ -734,30 +928,28 @@ void drawPageCall() {
 
     tft.setTextColor(COLOR_DIM, COLOR_BG);
     tft.setTextFont(2);
-    tft.setCursor(100, contentY + 60);
+    tft.setCursor(100, CONTENT_Y + 60);
     tft.print(st.call_phone);
 
     tft.setTextColor(COLOR_CALL, COLOR_BG);
-    tft.setCursor(100, contentY + 90);
+    tft.setCursor(100, CONTENT_Y + 90);
     tft.print("Incoming call");
 }
 
 void drawPageSms() {
-    int contentY = 18;
-    int contentH = SCREEN_H - 22 - 18;
-    tft.fillRect(0, contentY, SCREEN_W, contentH, COLOR_BG);
+    tft.fillRect(0, CONTENT_Y, SCREEN_W, CONTENT_H, COLOR_BG);
 
-    tft.fillRect(0, contentY, SCREEN_W, 24, COLOR_SMS);
+    tft.fillRect(0, CONTENT_Y, SCREEN_W, 24, COLOR_SMS);
     tft.setTextColor(COLOR_BG, COLOR_SMS);
     tft.setTextFont(2);
     char fromBuf[40];
     snprintf(fromBuf, sizeof(fromBuf), "  Msg from %s", st.sms_from);
-    tft.setCursor(4, contentY + 5);
+    tft.setCursor(4, CONTENT_Y + 5);
     tft.print(fromBuf);
 
     tft.setTextColor(COLOR_FG, COLOR_BG);
     tft.setTextFont(2);
-    const int bodyY = contentY + 32;
+    const int bodyY = CONTENT_Y + 32;
     const int lineH = 18;
     const int maxLines = 4;
     const int rightMargin = SCREEN_W - 10;
@@ -811,7 +1003,30 @@ void checkPageExpiration() {
 }
 
 void render() {
-    if (!needsRedraw && currentPage == lastDrawnPage) return;
+    // Detect speed-only updates so we don't have to repaint the whole
+    // NAV page (which would visibly flicker street text every second).
+    unsigned long now = millis();
+    bool speedFresh = (st.speed_kmh >= 0) && (now - st.speed_ts < SPEED_STALE);
+    bool speedChanged = (st.speed_kmh != lastDrawnSpeed) ||
+                        (speedFresh != lastSpeedFresh);
+
+    if (!needsRedraw && currentPage == lastDrawnPage) {
+        // Lightweight refresh path: only update the speed panel/area
+        // when the value has changed.
+        if (speedChanged) {
+            if (currentPage == PAGE_NAV) {
+                drawSpeedPanel(0, CONTENT_Y, SPLIT_X, CONTENT_H);
+            } else if (currentPage == PAGE_IDLE) {
+                drawPageIdle();
+            } else {
+                // CALL/SMS show speed in the bottom bar; redraw it
+                drawBottomBar();
+                lastDrawnSpeed = st.speed_kmh;
+                lastSpeedFresh = speedFresh;
+            }
+        }
+        return;
+    }
 
     if (currentPage != lastDrawnPage) {
         tft.fillScreen(COLOR_BG);
@@ -868,7 +1083,7 @@ void setupBLE() {
 void setup() {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("\n=== Car HUD v2 starting ===");
+    Serial.println("\n=== Car HUD v3 starting ===");
 
     pinMode(TFT_BL, OUTPUT);
     digitalWrite(TFT_BL, HIGH);
@@ -879,7 +1094,7 @@ void setup() {
     tft.setTextColor(COLOR_ACCENT, COLOR_BG);
     tft.setTextFont(4);
     tft.setCursor(40, 60);
-    tft.print("Car HUD v2");
+    tft.print("Car HUD v3");
     tft.setTextFont(2);
     tft.setTextColor(COLOR_DIM, COLOR_BG);
     tft.setCursor(40, 100);
