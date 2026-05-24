@@ -17,24 +17,6 @@
  *
  * Compatible with: Arduino-ESP32 core 2.x + NimBLE-Arduino 1.4.x + ArduinoJson 6.x
  *
- * Build:
- *   - PlatformIO: place this file in `src/` of an espressif32 project.
- *     Example platformio.ini:
- *
- *       [env:esp32-s3]
- *       platform     = espressif32
- *       board        = esp32-s3-devkitc-1
- *       framework    = arduino
- *       monitor_speed = 115200
- *       lib_deps =
- *           bodmer/TFT_eSPI@^2.5.43
- *           h2zero/NimBLE-Arduino@^1.4.2
- *           bblanchon/ArduinoJson@^6.21.5
- *
- *   - Arduino IDE: rename back to .ino (Arduino auto-generates forward
- *     declarations and #include <Arduino.h>; .cpp users do it manually,
- *     which is why this file does both explicitly).
- *
  * BLE Service:
  *   Service UUID:        6e400001-b5a3-f393-e0a9-e50e24dcca9e
  *   RX Characteristic:   6e400002-b5a3-f393-e0a9-e50e24dcca9e (WRITE)
@@ -47,34 +29,6 @@
 #include <NimBLEDevice.h>
 #include <ctype.h>
 #include <string.h>
-
-// ============================================================
-//  Forward declarations
-//  (Arduino IDE auto-generates these for .ino files; in a plain
-//  .cpp we list them explicitly so call-order between functions
-//  is not fragile.)
-// ============================================================
-enum ArrowType : int;
-static void  str_canon(const char* in, char* out, size_t outSize);
-static ArrowType parseArrow(const char* raw);
-void  handleJsonMessage(const std::string& raw);
-static void  drawShaft(int cx, int cy, int len, int thick, uint16_t color);
-void  drawArrowShape(ArrowType type, int cx, int cy, int s, uint16_t color);
-void  drawTopBar();
-void  drawBottomBar();
-void  drawPageIdle();
-static bool  abbreviateStreet(char* s, size_t n);
-static void  wrapTwoLines(const char* text, int maxW,
-                          char* line1, size_t l1Size,
-                          char* line2, size_t l2Size);
-void  drawPageNav();
-void  drawPageCall();
-void  drawPageSms();
-void  checkPageExpiration();
-void  render();
-void  setupBLE();
-void  setup();
-void  loop();
 
 // ============================================================
 //  BLE UUIDs
@@ -114,7 +68,7 @@ enum Page {
 };
 
 // Normalized arrow types — handler converts raw string to this
-enum ArrowType : int {
+enum ArrowType {
     ARR_NONE = 0,
     ARR_STRAIGHT,
     ARR_RIGHT,
