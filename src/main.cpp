@@ -580,7 +580,9 @@ void drawSpeedPanel(int x, int y, int w, int h) {
     tft.setTextFont(unitFont);
     int unitH = tft.fontHeight();
     int blockH = numH + unitGap + unitH;
-    int blockY = y + (h - blockH) / 2;
+    // +2 px nudge so the block sits slightly below true center,
+    // which looks better visually against the divider and bottom bar.
+    int blockY = y + (h - blockH) / 2 + 4;
 
     // Draw number
     tft.setTextFont(7);
