@@ -27,6 +27,7 @@
 #include <TFT_eSPI.h>
 #include <ArduinoJson.h>
 #include <NimBLEDevice.h>
+#include <Preferences.h>
 #include <ctype.h>
 #include <string.h>
 #include <math.h>
@@ -35,8 +36,17 @@
 //  Forward declarations
 // ============================================================
 enum ArrowType : int;
+enum DisplayFlip : uint8_t;
 static void  str_canon(const char* in, char* out, size_t outSize);
 static ArrowType parseArrow(const char* raw);
+static bool  parseDisplayFlip(const char* raw, DisplayFlip* out);
+static const char* displayFlipToWire(DisplayFlip flip);
+static void  loadDisplayConfig();
+static void  saveDisplayConfig();
+static void  setupBacklight();
+static void  applyBacklight();
+static void  applyDisplayTransform();
+static void  handleConfigMessage(JsonObject doc);
 static void  formatDistance(float meters, bool unitIsKm,
                             char* out, size_t outSize);
 void  handleJsonMessage(const std::string& raw);
@@ -46,13 +56,17 @@ void  drawTopBar();
 void  drawBottomBar();
 void  drawSpeedPanel(int x, int y, int w, int h);
 void  drawPageIdle();
+void  drawHudPageIdle();
 static bool  abbreviateStreet(char* s, size_t n);
 static void  wrapTwoLines(const char* text, int maxW,
                           char* line1, size_t l1Size,
                           char* line2, size_t l2Size);
 void  drawPageNav();
+void  drawHudPageNav();
 void  drawPageCall();
+void  drawHudPageCall();
 void  drawPageSms();
+void  drawHudPageSms();
 void  checkPageExpiration();
 void  render();
 void  setupBLE();
@@ -82,6 +96,9 @@ TFT_eSPI tft = TFT_eSPI();
 #define COLOR_WARN     0xF800  // red
 #define COLOR_DIM      0x630C  // gray
 #define COLOR_HEADER   0x0841  // dark blue
+#define COLOR_HUD_GREEN 0x07E0
+#define COLOR_HUD_AMBER 0xFD20
+#define COLOR_HUD_WHITE 0xFFFF
 
 const int SCREEN_W = 320;
 const int SCREEN_H = 170;
@@ -90,6 +107,28 @@ const int SCREEN_H = 170;
 const int SPLIT_X      = 128;            // 40% of 320
 const int CONTENT_Y    = 18;
 const int CONTENT_H    = SCREEN_H - 22 - 18;  // 130
+
+const uint8_t DISPLAY_ROTATION = 1;
+const bool DEFAULT_HUD_MODE = false;
+const uint8_t DEFAULT_BRIGHTNESS = 255;
+
+enum DisplayFlip : uint8_t {
+    FLIP_NONE = 0,
+    FLIP_VERTICAL,
+    FLIP_HORIZONTAL,
+    FLIP_ROTATE_180
+};
+
+const DisplayFlip DEFAULT_HUD_FLIP = FLIP_VERTICAL;
+
+struct DisplayConfig {
+    bool hud_mode = DEFAULT_HUD_MODE;
+    DisplayFlip hud_flip = DEFAULT_HUD_FLIP;
+    uint8_t brightness = DEFAULT_BRIGHTNESS;
+};
+
+DisplayConfig cfg;
+Preferences prefs;
 
 // ============================================================
 //  State machine
@@ -147,6 +186,7 @@ struct StateData {
 StateData st;
 Page currentPage   = PAGE_IDLE;
 Page lastDrawnPage = (Page)(-1);
+bool lastDrawnHudMode = DEFAULT_HUD_MODE;
 bool needsRedraw   = true;
 
 // Track previous speed value separately so we can repaint just the
@@ -163,6 +203,223 @@ const unsigned long BAT_STALE    = 120000;
 
 NimBLECharacteristic* pTxChar = nullptr;
 NimBLEServer*         pServer = nullptr;
+
+// ============================================================
+//  Display config, HUD transform, backlight
+// ============================================================
+static bool parseDisplayFlip(const char* raw, DisplayFlip* out) {
+    if (!raw || !out) return false;
+
+    char k[20];
+    str_canon(raw, k, sizeof(k));
+
+    if (!strcmp(k, "none") || !strcmp(k, "off") ||
+        !strcmp(k, "normal") || !strcmp(k, "n")) {
+        *out = FLIP_NONE;
+        return true;
+    }
+    if (!strcmp(k, "v") || !strcmp(k, "vertical") ||
+        !strcmp(k, "topbottom") || !strcmp(k, "updown") ||
+        !strcmp(k, "tb") || !strcmp(k, "ud")) {
+        *out = FLIP_VERTICAL;
+        return true;
+    }
+    if (!strcmp(k, "h") || !strcmp(k, "horizontal") ||
+        !strcmp(k, "leftright") || !strcmp(k, "lr")) {
+        *out = FLIP_HORIZONTAL;
+        return true;
+    }
+    if (!strcmp(k, "r180") || !strcmp(k, "rotate180") ||
+        !strcmp(k, "rot180") || !strcmp(k, "180")) {
+        *out = FLIP_ROTATE_180;
+        return true;
+    }
+    return false;
+}
+
+static const char* displayFlipToWire(DisplayFlip flip) {
+    switch (flip) {
+        case FLIP_VERTICAL:   return "v";
+        case FLIP_HORIZONTAL: return "h";
+        case FLIP_ROTATE_180: return "r180";
+        default:              return "none";
+    }
+}
+
+static DisplayFlip sanitizeDisplayFlip(uint8_t value) {
+    if (value <= (uint8_t)FLIP_ROTATE_180) return (DisplayFlip)value;
+    return DEFAULT_HUD_FLIP;
+}
+
+static void loadDisplayConfig() {
+    prefs.begin("display", true);
+    cfg.hud_mode = prefs.getBool("hud", DEFAULT_HUD_MODE);
+    cfg.hud_flip = sanitizeDisplayFlip(prefs.getUChar("flip", DEFAULT_HUD_FLIP));
+    cfg.brightness = prefs.getUChar("br", DEFAULT_BRIGHTNESS);
+    prefs.end();
+
+    Serial.printf("[CFG] mode=%s flip=%s br=%u\n",
+                  cfg.hud_mode ? "hud" : "normal",
+                  displayFlipToWire(cfg.hud_flip),
+                  cfg.brightness);
+}
+
+static void saveDisplayConfig() {
+    prefs.begin("display", false);
+    prefs.putBool("hud", cfg.hud_mode);
+    prefs.putUChar("flip", (uint8_t)cfg.hud_flip);
+    prefs.putUChar("br", cfg.brightness);
+    prefs.end();
+}
+
+static void notifyConfigAck() {
+    if (!pTxChar) return;
+
+    char msg[96];
+    snprintf(msg, sizeof(msg),
+             "{\"t\":\"cfg\",\"mode\":\"%s\",\"flip\":\"%s\",\"br\":%u}",
+             cfg.hud_mode ? "hud" : "normal",
+             displayFlipToWire(cfg.hud_flip),
+             cfg.brightness);
+
+    pTxChar->setValue(msg);
+    if (st.ble_connected) pTxChar->notify();
+}
+
+static uint8_t madctlForHudFlip(DisplayFlip flip) {
+    // Base is TFT_eSPI ST7789 landscape rotation 1:
+    // TFT_MAD_MX | TFT_MAD_MV | TFT_MAD_COLOR_ORDER.
+    // The extra cases keep the logical 320x170 drawing area, but flip the
+    // controller scan direction so reflection on glass can be corrected.
+    switch (flip) {
+        case FLIP_VERTICAL:
+            return TFT_MAD_MX | TFT_MAD_MY | TFT_MAD_MV | TFT_MAD_COLOR_ORDER;
+        case FLIP_HORIZONTAL:
+            return TFT_MAD_MV | TFT_MAD_COLOR_ORDER;
+        case FLIP_ROTATE_180:
+            return TFT_MAD_MY | TFT_MAD_MV | TFT_MAD_COLOR_ORDER;
+        default:
+            return TFT_MAD_MX | TFT_MAD_MV | TFT_MAD_COLOR_ORDER;
+    }
+}
+
+static void applyDisplayTransform() {
+    DisplayFlip activeFlip = cfg.hud_mode ? cfg.hud_flip : FLIP_NONE;
+
+    tft.setRotation(DISPLAY_ROTATION);
+    tft.writecommand(TFT_MADCTL);
+    tft.writedata(madctlForHudFlip(activeFlip));
+}
+
+#if defined(TFT_BL)
+static const uint8_t BL_PWM_CHANNEL = 0;
+static const uint32_t BL_PWM_FREQ = 5000;
+static const uint8_t BL_PWM_BITS = 8;
+static bool backlightReady = false;
+#endif
+
+static void applyBacklight() {
+#if defined(TFT_BL)
+    if (!backlightReady) return;
+
+    uint8_t duty = cfg.brightness;
+#if defined(TFT_BACKLIGHT_ON) && (TFT_BACKLIGHT_ON == LOW)
+    duty = 255 - duty;
+#endif
+    ledcWrite(BL_PWM_CHANNEL, duty);
+#endif
+}
+
+static void setupBacklight() {
+#if defined(TFT_BL)
+    ledcSetup(BL_PWM_CHANNEL, BL_PWM_FREQ, BL_PWM_BITS);
+    ledcAttachPin(TFT_BL, BL_PWM_CHANNEL);
+    backlightReady = true;
+    applyBacklight();
+#endif
+}
+
+static void handleConfigMessage(JsonObject doc) {
+    bool changed = false;
+    bool transformChanged = false;
+    bool brightnessChanged = false;
+
+    bool newHudMode = cfg.hud_mode;
+    DisplayFlip newFlip = cfg.hud_flip;
+    uint8_t newBrightness = cfg.brightness;
+
+    if (doc.containsKey("mode")) {
+        const char* mode = doc["mode"] | "";
+        char k[12];
+        str_canon(mode, k, sizeof(k));
+
+        if (!strcmp(k, "hud")) {
+            newHudMode = true;
+        } else if (!strcmp(k, "normal") || !strcmp(k, "direct") ||
+                   !strcmp(k, "screen")) {
+            newHudMode = false;
+        } else {
+            Serial.printf("[CFG] unknown mode: %s\n", mode);
+        }
+    }
+
+    if (doc.containsKey("hud")) {
+        newHudMode = doc["hud"].as<bool>();
+    }
+
+    if (doc.containsKey("flip")) {
+        const char* flipRaw = doc["flip"] | "";
+        if (!parseDisplayFlip(flipRaw, &newFlip)) {
+            Serial.printf("[CFG] unknown flip: %s\n", flipRaw);
+        }
+    }
+
+    int br = -1;
+    if (doc.containsKey("br")) {
+        br = doc["br"] | -1;
+    } else if (doc.containsKey("brightness")) {
+        br = doc["brightness"] | -1;
+    }
+    if (br >= 0) {
+        if (br > 255) br = 255;
+        newBrightness = (uint8_t)br;
+    }
+
+    if (newHudMode != cfg.hud_mode) {
+        cfg.hud_mode = newHudMode;
+        changed = true;
+        transformChanged = true;
+    }
+    if (newFlip != cfg.hud_flip) {
+        cfg.hud_flip = newFlip;
+        changed = true;
+        if (cfg.hud_mode) transformChanged = true;
+    }
+    if (newBrightness != cfg.brightness) {
+        cfg.brightness = newBrightness;
+        changed = true;
+        brightnessChanged = true;
+    }
+
+    if (brightnessChanged) applyBacklight();
+    if (transformChanged) {
+        applyDisplayTransform();
+        tft.fillScreen(COLOR_BG);
+        lastDrawnPage = (Page)(-1);
+    }
+
+    bool save = doc["save"] | true;
+    if (changed && save) saveDisplayConfig();
+
+    Serial.printf("[CFG] mode=%s flip=%s br=%u%s\n",
+                  cfg.hud_mode ? "hud" : "normal",
+                  displayFlipToWire(cfg.hud_flip),
+                  cfg.brightness,
+                  save ? " saved" : "");
+
+    needsRedraw = true;
+    notifyConfigAck();
+}
 
 // ============================================================
 //  Arrow string normalization
@@ -331,6 +588,9 @@ void handleJsonMessage(const std::string& raw) {
         st.bat_pct = doc["p"] | -1;
         st.bat_ts  = now;
         needsRedraw = true;
+    }
+    else if (!strcmp(type, "cfg") || !strcmp(type, "hud")) {
+        handleConfigMessage(doc.as<JsonObject>());
     }
     else if (!strcmp(type, "clr")) {
         currentPage = PAGE_IDLE;
@@ -908,6 +1168,228 @@ void drawPageNav() {
     }
 }
 
+// ============================================================
+//  HUD pages
+//
+//  HUD mode removes top/bottom bars and keeps the driving surface
+//  minimal: speed + arrow + distance. The display transform is applied
+//  at controller level, so drawing coordinates stay normal here.
+// ============================================================
+static bool speedFreshNow() {
+    unsigned long now = millis();
+    return (st.speed_kmh >= 0) && (now - st.speed_ts < SPEED_STALE);
+}
+
+static void drawHudSpeedPanel(int x, int y, int w, int h) {
+    tft.fillRect(x, y, w, h, COLOR_BG);
+
+    bool fresh = speedFreshNow();
+    char numBuf[8];
+    if (fresh) snprintf(numBuf, sizeof(numBuf), "%d", st.speed_kmh);
+    else       strlcpy(numBuf, "--", sizeof(numBuf));
+
+    tft.setTextFont(7);
+    tft.setTextSize(2);
+    tft.setTextColor(fresh ? COLOR_HUD_GREEN : COLOR_DIM, COLOR_BG);
+
+    int numW = tft.textWidth(numBuf);
+    int numH = 96;
+    if (numW > w - 8) {
+        tft.setTextSize(1);
+        numW = tft.textWidth(numBuf);
+        numH = 48;
+    }
+
+    tft.setTextFont(4);
+    tft.setTextSize(1);
+    int unitH = tft.fontHeight();
+    const int unitGap = 4;
+    int blockH = numH + unitGap + unitH;
+    int numX = x + (w - numW) / 2;
+    int numY = y + (h - blockH) / 2 + 2;
+
+    tft.setTextFont(7);
+    tft.setCursor(numX, numY);
+    tft.print(numBuf);
+    tft.setTextSize(1);
+
+    tft.setTextFont(4);
+    tft.setTextColor(fresh ? COLOR_HUD_AMBER : COLOR_DIM, COLOR_BG);
+    const char* unit = "km/h";
+    int unitW = tft.textWidth(unit);
+    tft.setCursor(x + (w - unitW) / 2, numY + numH + unitGap);
+    tft.print(unit);
+
+    lastDrawnSpeed = st.speed_kmh;
+    lastSpeedFresh = fresh;
+}
+
+static void drawHudMiniSpeed(int x, int y, int w, int h) {
+    tft.fillRect(x, y, w, h, COLOR_BG);
+
+    bool fresh = speedFreshNow();
+    char buf[8];
+    if (fresh) snprintf(buf, sizeof(buf), "%d", st.speed_kmh);
+    else       strlcpy(buf, "--", sizeof(buf));
+
+    tft.setTextFont(7);
+    tft.setTextSize(1);
+    tft.setTextColor(fresh ? COLOR_HUD_GREEN : COLOR_DIM, COLOR_BG);
+    int numW = tft.textWidth(buf);
+    tft.setCursor(x + (w - numW) / 2, y + 2);
+    tft.print(buf);
+    tft.setTextSize(1);
+
+    tft.setTextFont(2);
+    tft.setTextColor(fresh ? COLOR_HUD_AMBER : COLOR_DIM, COLOR_BG);
+    const char* unit = "km/h";
+    int unitW = tft.textWidth(unit);
+    tft.setCursor(x + (w - unitW) / 2, y + 52);
+    tft.print(unit);
+
+    lastDrawnSpeed = st.speed_kmh;
+    lastSpeedFresh = fresh;
+}
+
+static void drawHudDistancePanel(int x, int y, int w, int h) {
+    tft.fillRect(x, y, w, h, COLOR_BG);
+
+    char distStr[16];
+    formatDistance(st.nav_dist_m, false, distStr, sizeof(distStr));
+
+    char distNum[12] = "";
+    char distUnit[6] = "";
+    const char* sp = strchr(distStr, ' ');
+    if (sp) {
+        size_t nlen = (size_t)(sp - distStr);
+        if (nlen >= sizeof(distNum)) nlen = sizeof(distNum) - 1;
+        memcpy(distNum, distStr, nlen);
+        distNum[nlen] = '\0';
+        strlcpy(distUnit, sp + 1, sizeof(distUnit));
+    } else {
+        strlcpy(distNum, distStr, sizeof(distNum));
+    }
+
+    tft.setTextFont(6);
+    tft.setTextSize(1);
+    int numW = tft.textWidth(distNum);
+    int numH = tft.fontHeight();
+    if (numW > w - 4) {
+        tft.setTextFont(4);
+        numW = tft.textWidth(distNum);
+        numH = tft.fontHeight();
+    }
+
+    int numX = x + (w - numW) / 2;
+    int numY = y + (h - numH - 28) / 2;
+    if (numY < y) numY = y;
+
+    tft.setTextColor(COLOR_HUD_WHITE, COLOR_BG);
+    tft.setCursor(numX, numY);
+    tft.print(distNum);
+
+    tft.setTextFont(4);
+    tft.setTextColor(COLOR_HUD_AMBER, COLOR_BG);
+    int unitW = tft.textWidth(distUnit);
+    tft.setCursor(x + (w - unitW) / 2, numY + numH + 4);
+    tft.print(distUnit);
+}
+
+void drawHudPageNav() {
+    tft.fillScreen(COLOR_BG);
+
+    const int speedW = 128;
+    const int dividerX = speedW + 2;
+    drawHudSpeedPanel(0, 0, speedW, SCREEN_H);
+    tft.drawFastVLine(dividerX, 12, SCREEN_H - 24, COLOR_HUD_AMBER);
+
+    uint16_t arrowColor = (st.nav_arrow == ARR_UNKNOWN || st.nav_arrow == ARR_NONE)
+                           ? COLOR_HUD_AMBER : COLOR_HUD_GREEN;
+    drawArrowShape(st.nav_arrow, 174, 82, 36, arrowColor);
+    drawHudDistancePanel(220, 28, 96, 112);
+}
+
+void drawHudPageIdle() {
+    tft.fillScreen(COLOR_BG);
+
+    if (speedFreshNow()) {
+        drawHudSpeedPanel(34, 0, 252, SCREEN_H);
+    } else {
+        drawHudSpeedPanel(70, 0, 180, SCREEN_H);
+        tft.setTextFont(2);
+        tft.setTextColor(COLOR_DIM, COLOR_BG);
+        const char* msg = st.ble_connected ? "Waiting for data" : "BLE disconnected";
+        int msgW = tft.textWidth(msg);
+        tft.setCursor((SCREEN_W - msgW) / 2, SCREEN_H - 24);
+        tft.print(msg);
+    }
+}
+
+void drawHudPageCall() {
+    tft.fillScreen(COLOR_BG);
+
+    int icx = 42, icy = 55;
+    tft.drawCircle(icx, icy, 25, COLOR_HUD_GREEN);
+    tft.drawCircle(icx, icy, 26, COLOR_HUD_GREEN);
+    tft.fillRoundRect(icx - 13, icy - 4, 26, 12, 4, COLOR_HUD_GREEN);
+    tft.fillRect(icx - 15, icy - 13, 7, 11, COLOR_HUD_GREEN);
+    tft.fillRect(icx + 8,  icy - 13, 7, 11, COLOR_HUD_GREEN);
+
+    tft.setTextFont(2);
+    tft.setTextColor(COLOR_HUD_AMBER, COLOR_BG);
+    tft.setCursor(86, 16);
+    tft.print("CALL");
+
+    char nameBuf[32];
+    strlcpy(nameBuf, st.call_name, sizeof(nameBuf));
+    tft.setTextFont(4);
+    tft.setTextColor(COLOR_HUD_WHITE, COLOR_BG);
+    while (tft.textWidth(nameBuf) > 152 && strlen(nameBuf) > 3) {
+        nameBuf[strlen(nameBuf) - 1] = '\0';
+    }
+    tft.setCursor(86, 48);
+    tft.print(nameBuf);
+
+    tft.setTextFont(2);
+    tft.setTextColor(COLOR_DIM, COLOR_BG);
+    tft.setCursor(86, 88);
+    tft.print(st.call_phone);
+
+    drawHudMiniSpeed(248, 94, 68, 72);
+}
+
+void drawHudPageSms() {
+    tft.fillScreen(COLOR_BG);
+
+    tft.setTextFont(2);
+    tft.setTextColor(COLOR_HUD_AMBER, COLOR_BG);
+    tft.setCursor(8, 12);
+    tft.print("MSG");
+
+    char fromBuf[32];
+    strlcpy(fromBuf, st.sms_from, sizeof(fromBuf));
+    tft.setTextFont(4);
+    tft.setTextColor(COLOR_HUD_WHITE, COLOR_BG);
+    while (tft.textWidth(fromBuf) > 230 && strlen(fromBuf) > 3) {
+        fromBuf[strlen(fromBuf) - 1] = '\0';
+    }
+    tft.setCursor(8, 38);
+    tft.print(fromBuf);
+
+    tft.setTextFont(2);
+    tft.setTextColor(COLOR_HUD_GREEN, COLOR_BG);
+    char l1[96], l2[96];
+    wrapTwoLines(st.sms_msg, 230, l1, sizeof(l1), l2, sizeof(l2));
+    tft.setCursor(8, 82);
+    tft.print(l1);
+    if (l2[0]) {
+        tft.setCursor(8, 102);
+        tft.print(l2);
+    }
+
+    drawHudMiniSpeed(248, 94, 68, 72);
+}
+
 void drawPageCall() {
     tft.fillRect(0, CONTENT_Y, SCREEN_W, CONTENT_H, COLOR_BG);
 
@@ -1011,37 +1493,58 @@ void render() {
     bool speedFresh = (st.speed_kmh >= 0) && (now - st.speed_ts < SPEED_STALE);
     bool speedChanged = (st.speed_kmh != lastDrawnSpeed) ||
                         (speedFresh != lastSpeedFresh);
+    bool modeChanged = (cfg.hud_mode != lastDrawnHudMode);
 
-    if (!needsRedraw && currentPage == lastDrawnPage) {
+    if (!needsRedraw && currentPage == lastDrawnPage && !modeChanged) {
         // Lightweight refresh path: only update the speed panel/area
         // when the value has changed.
         if (speedChanged) {
-            if (currentPage == PAGE_NAV) {
-                drawSpeedPanel(0, CONTENT_Y, SPLIT_X, CONTENT_H);
-            } else if (currentPage == PAGE_IDLE) {
-                drawPageIdle();
+            if (cfg.hud_mode) {
+                switch (currentPage) {
+                    case PAGE_NAV:  drawHudPageNav();  break;
+                    case PAGE_CALL: drawHudPageCall(); break;
+                    case PAGE_SMS:  drawHudPageSms();  break;
+                    default:        drawHudPageIdle(); break;
+                }
             } else {
-                // CALL/SMS show speed in the bottom bar; redraw it
-                drawBottomBar();
-                lastDrawnSpeed = st.speed_kmh;
-                lastSpeedFresh = speedFresh;
+                if (currentPage == PAGE_NAV) {
+                    drawSpeedPanel(0, CONTENT_Y, SPLIT_X, CONTENT_H);
+                } else if (currentPage == PAGE_IDLE) {
+                    drawPageIdle();
+                } else {
+                    // CALL/SMS show speed in the bottom bar; redraw it
+                    drawBottomBar();
+                    lastDrawnSpeed = st.speed_kmh;
+                    lastSpeedFresh = speedFresh;
+                }
             }
         }
         return;
     }
 
-    if (currentPage != lastDrawnPage) {
+    if (currentPage != lastDrawnPage || modeChanged) {
         tft.fillScreen(COLOR_BG);
         lastDrawnPage = currentPage;
+        lastDrawnHudMode = cfg.hud_mode;
     }
-    drawTopBar();
-    switch (currentPage) {
-        case PAGE_NAV:  drawPageNav();  break;
-        case PAGE_CALL: drawPageCall(); break;
-        case PAGE_SMS:  drawPageSms();  break;
-        default:        drawPageIdle(); break;
+
+    if (cfg.hud_mode) {
+        switch (currentPage) {
+            case PAGE_NAV:  drawHudPageNav();  break;
+            case PAGE_CALL: drawHudPageCall(); break;
+            case PAGE_SMS:  drawHudPageSms();  break;
+            default:        drawHudPageIdle(); break;
+        }
+    } else {
+        drawTopBar();
+        switch (currentPage) {
+            case PAGE_NAV:  drawPageNav();  break;
+            case PAGE_CALL: drawPageCall(); break;
+            case PAGE_SMS:  drawPageSms();  break;
+            default:        drawPageIdle(); break;
+        }
+        drawBottomBar();
     }
-    drawBottomBar();
     needsRedraw = false;
 }
 
@@ -1087,10 +1590,11 @@ void setup() {
     delay(1000);
     Serial.println("\n=== Car HUD v3 starting ===");
 
-    pinMode(TFT_BL, OUTPUT);
-    digitalWrite(TFT_BL, HIGH);
+    loadDisplayConfig();
+    setupBacklight();
+
     tft.init();
-    tft.setRotation(1);
+    applyDisplayTransform();
     tft.fillScreen(COLOR_BG);
 
     tft.setTextColor(COLOR_ACCENT, COLOR_BG);

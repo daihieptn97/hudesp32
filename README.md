@@ -82,10 +82,12 @@ Pin TFT được khai báo qua `User_Setup.h` của thư viện `TFT_eSPI` — f
 | `PAGE_CALL` | Nhận `call`              | Sau 30 s, hoặc bị `nav` mới ghi đè (call ưu tiên thấp hơn nav khi cùng tồn tại — nav vẫn quay lại sau khi call hết hạn) |
 | `PAGE_SMS`  | Nhận `sms`               | Sau 15 s                                       |
 
-Bottom bar (speed / clock / battery) hiển thị **trên mọi page**, độc lập với state machine, và tự đánh dấu "stale" (xám đi) sau:
+Ở `normal mode`, bottom bar (speed / clock / battery) hiển thị **trên mọi page**, độc lập với state machine, và tự đánh dấu "stale" (xám đi) sau:
 - Speed: 10 s
 - Clock: 120 s
 - Battery: 120 s
+
+Ở `HUD mode`, firmware bỏ top bar / bottom bar để giảm nhiễu khi phản chiếu lên kính. NAV chỉ còn tốc độ + mũi tên + khoảng cách; CALL/SMS vẫn hiện bằng layout tối giản.
 
 ---
 
@@ -115,6 +117,7 @@ Tất cả gói đều là JSON. Field `"t"` quyết định loại; các field 
 | `sms`   | Tin nhắn / noti    | `f` *(string)* — người gửi<br>`m` *(string)* — nội dung                                  | `PAGE_SMS`    | 15 s    |
 | `clk`   | Đồng hồ            | `h` *(int 0–23)*<br>`m` *(int 0–59)*                                                     | bottom bar    | 120 s   |
 | `bat`   | Pin điện thoại     | `p` *(int 0–100)*                                                                        | bottom bar    | 120 s   |
+| `cfg` / `hud` | Cấu hình màn hình | `mode`, `hud`, `flip`, `br`, `brightness`, `save` — xem 4.4                              | không đổi page | —       |
 | `clr`   | Xóa, về IDLE       | (không có field nào khác)                                                                | `PAGE_IDLE`   | —       |
 
 ### 4.3. Bảng giá trị `arr` (arrow type)
@@ -135,13 +138,48 @@ ESP32 chuẩn hóa chuỗi: bỏ ký tự `-`, `_`, khoảng trắng, đổi san
 | `arrive`, `arrived`, `destination`, `end`                       | Cờ đích                  |
 | *(bất kỳ giá trị nào khác)*                                     | Badge đỏ `?` + log Serial — đây là dấu hiệu app gửi sai tên |
 
-### 4.4. Ví dụ payload
+### 4.4. Cấu hình HUD / màn hình
+
+Gửi vào RX characteristic:
+
+```json
+{"t":"cfg","mode":"hud","flip":"v","br":255}
+{"t":"cfg","mode":"normal","br":180}
+{"t":"hud","hud":true,"flip":"v","brightness":220,"save":true}
+```
+
+Fields:
+
+| Field | Type | Mô tả |
+|---|---|---|
+| `mode` | string | `"hud"` để hắt kính, `"normal"` / `"direct"` / `"screen"` để xem trực tiếp |
+| `hud` | bool | Alias bật/tắt nhanh: `true` = HUD mode, `false` = normal mode |
+| `flip` | string | Chỉ áp dụng khi HUD mode bật. Giá trị: `"v"`/`"vertical"` lật trên-dưới; `"h"`/`"horizontal"` lật trái-phải; `"r180"` xoay 180; `"none"` không lật |
+| `br` / `brightness` | int | Độ sáng backlight `0..255`, `255` là sáng nhất |
+| `save` | bool | Mặc định `true`. Khi `true`, ESP32 lưu vào NVS và tự dùng lại sau reboot |
+
+Khuyến nghị cho cách đặt màn hình hiện tại: bắt đầu bằng:
+
+```json
+{"t":"cfg","mode":"hud","flip":"v","br":255}
+```
+
+Nếu nhìn qua kính vẫn sai chiều, Android nên cho user thử nhanh các giá trị `flip` theo thứ tự: `"v"`, `"h"`, `"r180"`, `"none"`. Việc này không cần flash firmware lại.
+
+Khi nhận lệnh cấu hình, ESP32 cập nhật TX characteristic và notify nếu Android đã bật notification:
+
+```json
+{"t":"cfg","mode":"hud","flip":"v","br":255}
+```
+
+### 4.5. Ví dụ payload
 
 ```json
 {"t":"nav","arr":"right","d":350,"u":"m","s":"Nguyen Trai"}
 {"t":"nav","arr":"uturn","d":1,"u":"km","s":"Quay dau tai vong xuyen"}
 {"t":"nav","arr":"arrive","d":0,"u":"m","s":"Den noi luc 09:35"}
 {"t":"spd","v":48}
+{"t":"cfg","mode":"hud","flip":"v","br":255}
 {"t":"clk","h":9,"m":27}
 {"t":"bat","p":83}
 {"t":"call","n":"Mom","p":"+84 912 345 678"}
@@ -149,9 +187,15 @@ ESP32 chuẩn hóa chuỗi: bỏ ký tự `-`, `_`, khoảng trắng, đổi san
 {"t":"clr"}
 ```
 
-### 4.5. TX characteristic (ESP32 → phone)
+### 4.6. TX characteristic (ESP32 → phone)
 
-Hiện firmware **chưa chủ động notify** trở lại — `pTxChar` được tạo sẵn cho mở rộng (gửi trạng thái HUD, ACK, lỗi parse) nhưng vòng `loop()` không phát gì. Phone vẫn có thể `READ` characteristic này nếu muốn lấy giá trị cuối cùng.
+Firmware hiện notify ACK cho lệnh `cfg` / `hud`, ví dụ:
+
+```json
+{"t":"cfg","mode":"hud","flip":"v","br":255}
+```
+
+Phone vẫn có thể `READ` characteristic này nếu muốn lấy giá trị cấu hình cuối cùng. Các lệnh dữ liệu như `nav`, `spd`, `call`, `sms` hiện chưa ACK để giảm traffic BLE.
 
 Sẵn sàng cho mở rộng:
 - ACK mỗi command đã xử lý
@@ -160,7 +204,11 @@ Sẵn sàng cho mở rộng:
 
 ---
 
-## 5. Bố cục màn hình NAV (đã sửa ở v2)
+## 5. Bố cục màn hình
+
+### 5.1. Normal mode
+
+Normal mode giữ giao diện xem trực tiếp trên màn hình. NAV chia 40/60:
 
 ```
  ┌─────────────────────────────────────────────────────┐
@@ -173,10 +221,9 @@ Sẵn sàng cho mở rộng:
  │           Nguyen Trai                               │
  │                                                     │
  ├─────────────────────────────────────────────────────┤
- │ 48 km/h           09:27              Bat 83%        │  bottom   (h=22)
+ │                  09:27              Bat 83%        │  bottom   (h=22)
  └─────────────────────────────────────────────────────┘
-        ←─ 0..95 ─→ ←──────── 100..312 ────────→
-         arrow zone        text zone
+        ←─ speed 40% ─→ ←──── nav 60% ────────→
 ```
 
 Quy tắc layout trong `drawPageNav()`:
@@ -200,18 +247,35 @@ Quy tắc layout trong `drawPageNav()`:
 
 Nếu sau khi viết tắt vẫn dài, dòng thứ 2 sẽ bị cắt và thay 2 ký tự cuối bằng `..`.
 
+### 5.2. HUD mode
+
+HUD mode dùng nền đen, màu chính xanh lá / cam / trắng, không vẽ top bar hoặc bottom bar:
+
+```
+ ┌─────────────────────────────────────────────────────┐
+ │                                                     │
+ │   48      │        ▶             350                │
+ │  km/h     │                       m                 │
+ │                                                     │
+ └─────────────────────────────────────────────────────┘
+    speed       arrow              distance
+```
+
+CALL/SMS vẫn hiện, nhưng ở layout tối giản và có tốc độ nhỏ ở góc phải dưới.
+
 ---
 
 ## 6. Debugging
 
 Serial monitor ở **115200 baud** in mọi sự kiện:
 
-| Log prefix     | Khi nào                                  |
-|----------------|------------------------------------------|
-| `[BLE]`        | Connect / disconnect / MTU change         |
-| `[RX]`         | Mọi gói JSON nhận được (raw text)         |
-| `[JSON]`       | Lỗi parse hoặc type không nhận dạng được  |
+| Log prefix     | Khi nào                                   |
+|----------------|-------------------------------------------|
+| `[BLE]`        | Connect / disconnect / MTU change          |
+| `[RX]`         | Mọi gói JSON nhận được (raw text)          |
+| `[JSON]`       | Lỗi parse hoặc type không nhận dạng được   |
 | `[NAV]`        | `arr` không khớp pattern nào → fallback `?` |
+| `[CFG]`        | Load/save cấu hình HUD, flip, brightness   |
 
 Trường hợp ảnh chụp ban đầu (số `900` không có đơn vị + hình tròn `?` thay vì mũi tên) sẽ xuất hiện log:
 ```
@@ -235,8 +299,10 @@ CarHUD_ESP32/
 
 ## 8. Roadmap
 
-- [ ] Notify lại phone qua TX characteristic (ACK + báo lỗi).
-- [ ] Lưu state cuối cùng vào NVS để khôi phục khi mất điện ngắn.
+- [x] Lệnh cấu hình HUD mode / normal mode qua BLE.
+- [x] Lưu cấu hình màn hình vào NVS.
+- [x] Notify lại phone qua TX characteristic cho lệnh cấu hình.
+- [ ] ACK / báo lỗi cho mọi command JSON.
 - [ ] Thêm 2 nút bấm vật lý: dismiss noti / chuyển page thủ công.
 - [ ] Hỗ trợ font Unicode để hiển thị dấu tiếng Việt thay vì ASCII.
 - [ ] Encrypt + pairing để chống phone lạ kết nối.
